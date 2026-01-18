@@ -1,0 +1,301 @@
+FIDDLER MCP SOLUTION - QUICK START GUIDE
+
+Natural language interface for analyzing Fiddler traffic using Google Gemini AI
+
+
+
+WHAT IS THIS?
+
+
+This solution lets you analyze Fiddler network traffic using natural language.
+Instead of manually inspecting code in sessions, just ask questions like:
+
+  "Which sessions were flagged by EKFiddle as suspicious?"
+  "Show me sessions from example.com in the last 5 minutes"
+  "What does the code in session 142 do?"
+  "Analyze high risk sessions flagged by EKFiddle and explain the threats"
+
+The Gemini AI automatically fetches data, analyzes code, and provides security insights.
+
+
+PREREQUISITES
+
+
+1. Windows with Fiddler Classic installed
+2. Python 3.8 or higher installed
+3. Google Gemini API key (free at: https://makersuite.google.com/app/apikey)
+4. EKFiddle extension installed in Fiddler with latest rules
+
+
+INSTALLATION - 5 MINUTES
+
+Step 1: Extract Files
+
+Extract the fiddler-mcp-solution package to a folder, for example:
+C:\FiddlerMCP\
+
+You should see these files:
+
+  setup-gemini-client.bat
+  gemini-fiddler-client.py
+  5ire-bridge.py
+  enhanced-bridge.py
+  CustomRules.js
+
+Step 2: Replace Fiddler's JS Script in the fiddler's instalation folder
+
+1. Open Fiddler 
+2. Go to: Rules → Customize Rules (or press Ctrl+R)
+3. This opens CustomRules.js in an editor
+4. Replace the ENTIRE contents with our CustomRules.js file from this solution
+5. Save the file
+
+Or, replace the whole CustomRules.js file which is located in Fiddler's Scripts folder
+
+Fiddler will now send session data to the MCP bridge.
+
+
+Step 3: Run Setup Batch Script
+
+1. Open Command Prompt as Administrator
+2. Navigate to the folder: cd C:\FiddlerMCP\
+3. Run: setup-gemini-client.bat
+4. Wait for dependencies to install (takes 1-2 minutes)
+
+The setup script will:
+
+  Check Python installation
+  Install required packages (google-generativeai, rich, Flask, etc.)
+  Verify file locations
+  Check Fiddler configuration
+
+
+STARTING THE SOLUTION
+
+You need TWO terminal windows running:
+
+Terminal 1 - Enhanced Bridge (HTTP Server)
+
+cd C:\FiddlerMCP\
+python enhanced-bridge.py
+
+Keep this running. It receives traffic from Fiddler.
+
+Terminal 2 - Gemini Client (AI Interface)
+
+cd C:\FiddlerMCP\
+python gemini-fiddler-client.py
+
+On first run, you'll be asked for your Gemini API key.
+Paste it and press Enter (it will be saved for future use).
+
+You should see:
+"Gemini-Powered Fiddler Traffic Analyzer"
+"Connected to MCP bridge"
+
+You're ready!
+
+
+
+USING THE SOLUTION
+
+Basic Queries
+
+Type natural language questions at the prompt:
+
+> show me recent sessions
+> which sessions are from google.com?
+> list suspicious sessions
+> what happened in the last 5 minutes?
+
+EKFiddle Security Analysis
+
+> which sessions were flagged by EKFiddle?
+> summarize suspicious sessions and explain the threats
+> analyze high risk sessions
+> what does the code in session 142 do?
+
+The AI will:
+
+1. Fetch relevant sessions from Fiddler
+2. Analyze response bodies (JavaScript, HTML, etc.)
+3. Explain threats and malicious behavior
+4. Provide security recommendations
+
+Session Inspection
+
+> show me the body of session 240
+> get headers for session 150
+> search for sessions from facebook.net
+
+Commands
+
+/stats - Show bridge statistics
+/tools - List available tools
+/history - Show conversation history
+/clear - Clear conversation history
+/help - Show help
+/quit - Exit
+
+EXAMPLE SESSION
+
+> You: which sessions were flagged by EKFiddle as suspicious?
+
+Calling tool: fiddler_mcp__live_sessions
+
+< Gemini:
+Found 3 suspicious sessions:
+
+1. Session 633 (HIGH risk) - live.primis.tech/liveVideo.php
+   Flagged for: Obfuscated malicious JS, Socgholish WMI checks
+
+2. Session 562 (HIGH risk) - cdn.confiant-integrations.net/wrap.js
+   Flagged for: Hex obfuscated functions, Multiple obfuscation chains
+
+3. Session 142 (HIGH risk) - connect.facebook.net/fbevents.js
+   Flagged for: JS Function with eval()
+
+Checking most critical session...
+
+Calling follow-up tool: fiddler_mcp__session_body
+
+< Gemini:
+Session 633 Code Analysis:
+The JavaScript contains Socgholish malware signatures:
+
+  WMI queries to detect sandboxes
+  Obfuscated payload using hex encoding
+  Dynamic eval() for code execution
+  Attempts to fingerprint the environment
+
+RECOMMENDATION: Block live.primis.tech domain immediately.
+
+TIPS
+
+Performance
+
+  The enhanced-bridge keeps last 1000 sessions in memory
+  Older sessions are automatically pruned
+  For large captures, use time filters: "sessions from last 10 minutes"
+
+Log Files
+
+  enhanced-bridge logs: Check terminal output
+  gemini-client logs: Check mcp_server.err.log
+  Set GEMINI_FIDDLER_VERBOSE_LOG=1 for detailed logging
+
+Best Practices
+
+1. Start enhanced-bridge BEFORE starting traffic capture
+2. Keep both terminals visible to monitor activity
+3. Use specific time ranges for better performance
+4. Focus on EKFiddle-flagged sessions for security analysis
+5. Ask follow-up questions to drill deeper into threats
+
+TROUBLESHOOTING
+
+"MCP server process has terminated"
+
+The 5ire-bridge.py subprocess crashed.
+Fix: Install missing dependencies:
+pip install mcp pydantic requests
+
+"Connection refused" / "Bridge not running"
+
+The enhanced-bridge.py is not running on port 8081.
+Fix: Start enhanced-bridge.py first, then the client.
+
+"No sessions found"
+
+Fiddler isn't sending data to the bridge.
+Fix:
+
+1. Check CustomRules.js is installed correctly
+2. Verify MCP_URL points to http://localhost:8081
+3. Reload Fiddler script: Rules → Reload Script
+
+Gemini not responding
+
+Check your API key is valid and has quota remaining.
+Visit: https://makersuite.google.com/app/apikey
+
+Slow performance
+
+1. Reduce query scope: "sessions from last 5 minutes"
+2. Use specific filters: "sessions from domain.com"
+3. Restart enhanced-bridge to clear old sessions
+
+
+
+FILE DESCRIPTIONS
+
+gemini-fiddler-client.py
+
+  Main entry point - the AI chat interface
+  Connects to Gemini AI and MCP bridge
+  Handles natural language queries
+
+5ire-bridge.py
+
+  MCP server (auto-started by client)
+  Provides structured tool interface
+  Translates AI requests to bridge calls
+
+enhanced-bridge.py
+
+  HTTP server (port 8081)
+  Receives traffic from Fiddler
+  Stores and filters sessions
+  Performs risk assessment using EKFiddle data
+
+CustomRules.js
+
+  Fiddler script extension
+  Captures session data
+  Extracts EKFiddle comments
+  Posts data to enhanced-bridge
+
+setup-gemini-client.bat
+
+  One-time setup script
+  Installs dependencies
+  Verifies configuration
+
+
+
+WORKFLOW OVERVIEW
+
+1. Fiddler captures HTTP/HTTPS traffic
+2. EKFiddle extension analyzes traffic for threats
+3. CustomRules.js sends session data to enhanced-bridge (port 8081)
+4. Enhanced-bridge stores sessions and performs risk assessment
+5. You ask questions in natural language
+6. Gemini client interprets your question
+7. 5ire-bridge translates to tool calls
+8. Enhanced-bridge returns relevant data
+9. Gemini analyzes and explains results
+10. You get insights in plain English
+
+
+For issues:
+
+1. Check terminal output for error messages
+2. Review mcp_server.err.log
+3. Verify all three components are running
+4. Ensure Fiddler script is correctly installed
+
+
+SUMMARY
+
+Three simple steps to start:
+
+1. Install CustomRules.js in Fiddler
+2. Run: python enhanced-bridge.py
+3. Run: python gemini-fiddler-client.py
+
+Then ask questions in natural language!
+
+The solution combines Fiddler's traffic capture, EKFiddle's threat
+intelligence, and Gemini AI's analysis to provide powerful security
+insights through a conversational interface.
+

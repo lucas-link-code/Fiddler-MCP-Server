@@ -204,10 +204,6 @@ See `MCP_Data_Flow.md` for a detailed walkthrough with code snippets.
 - Header and cookie analysis
 - Redirect chain investigation
 
-## License
-
-MIT
-
 ## Acknowledgments
 
 - EKFiddle for rule format inspiration

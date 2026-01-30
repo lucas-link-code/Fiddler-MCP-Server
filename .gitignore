@@ -1,0 +1,5 @@
+# Fiddler CustomRules - excluded to prevent accidental overwrites
+CustomRules.js
+
+# macOS
+.DS_Store

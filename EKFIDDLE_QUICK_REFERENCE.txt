@@ -1,0 +1,256 @@
+================================================================================
+EKFIDDLE-FOCUSED WORKFLOW - QUICK REFERENCE CARD
+================================================================================
+
+WHAT IS EKFIDDLE?
+Fiddler extension that analyzes traffic against threat intelligence and flags
+malicious sessions in the Comments column. This is AUTHORITATIVE intelligence.
+
+================================================================================
+STEP 1: LIST FLAGGED SESSIONS
+================================================================================
+
+QUERY:
+> list sessions flagged with ekfiddle comments
+
+RESULT: Clean list showing:
+- Session ID
+- Domain/Host
+- EKFiddle Comment (severity + threat type)
+- Sorted by severity (Critical > High > Medium > Low)
+
+Example Output:
+```
+EKFIDDLE-FLAGGED SESSIONS:
+
+Session 201 | evil.example.org      | Critical: Known malware distribution
+Session 142 | cdn.malicious-ads.com | High: JavaScript obfuscation with eval()
+Session 158 | tracking.adnetwork.io | Medium: Suspicious redirect chain
+
+FLAGGED DOMAINS TO INVESTIGATE:
+1. evil.example.org (1 session, Critical)
+2. cdn.malicious-ads.com (1 session, High)
+3. tracking.adnetwork.io (1 session, Medium)
+```
+
+================================================================================
+STEP 2: INVESTIGATE FLAGGED SESSION
+================================================================================
+
+QUERY:
+> are there any malicious sessions?
+
+OR
+
+> analyze session 201
+
+RESULT: Automatic deep-dive analysis:
+1. EKFiddle assessment shown first
+2. Behavioral analysis (malicious pattern checklist)
+3. Correlation between EKFiddle and behavioral findings
+4. Risk level and recommendations
+
+Example Output:
+```
+ANALYZING SESSION 201 (Critical: Known malware distribution site)
+
+EKFIDDLE ASSESSMENT: Critical - Known malware distribution site
+
+MALICIOUS PATTERN CHECKLIST:
+[X] Iframe/Script Injection: FOUND
+[X] Dynamic Code Execution: FOUND (eval, Function constructor)
+[X] Anti-Analysis: FOUND (referrer checks, localStorage counters)
+[ ] Redirection: NOT FOUND
+[ ] Overlay/UI Hijacking: NOT FOUND
+
+EKFIDDLE CORRELATION:
+✓ Behavioral analysis CONFIRMS EKFiddle assessment
+✓ Multiple malicious patterns detected
+✓ Threat intelligence validated
+
+CONCLUSION: CONFIRMED MALWARE
+RISK LEVEL: CRITICAL
+RECOMMENDATION: Block domain immediately
+```
+
+================================================================================
+ALTERNATIVE QUERIES
+================================================================================
+
+Listing:
+- "list all ekfiddle alerts"
+- "show sessions with ekfiddle comments"
+- "list critical sessions"
+- "show high severity threats"
+
+Investigation:
+- "analyze session 142"
+- "investigate the critical session"
+- "what does session 201 do?"
+- "explain the malware"
+
+Domain Analysis:
+- "analyze all sessions from evil.example.org"
+- "what domains were flagged?"
+- "investigate cdn.malicious-ads.com"
+
+Validation:
+- "does behavioral analysis confirm ekfiddle?"
+- "is session 142 really malicious?"
+- "validate ekfiddle for session 201"
+
+================================================================================
+EKFIDDLE COMMENT PATTERNS
+================================================================================
+
+Pattern                     → What System Looks For
+----------------------------------------------------------------
+"JavaScript obfuscation"   → String arrays, hex encoding
+"eval()"                   → Dynamic code execution
+"redirect"                 → window.location manipulation
+"suspicious domain"        → Domain reputation check
+"known malware"            → Full threat analysis
+"exploit kit"              → CVE references, advanced patterns
+"phishing"                 → Form manipulation, credentials
+
+================================================================================
+TRUST HIERARCHY
+================================================================================
+
+1. HIGHEST: EKFiddle Comments (authoritative threat intelligence)
+2. HIGH:    Behavioral Analysis (malicious pattern checklist)
+3. MEDIUM:  Heuristics (file extensions, keywords)
+4. LOWEST:  String Content (easily manipulated)
+
+When EKFiddle flags something, focus on CONFIRMING the threat type.
+
+================================================================================
+SEVERITY LEVELS
+================================================================================
+
+Critical → Immediate threat, confirmed malware - Investigate NOW
+High     → Strong malicious indicators - High priority
+Medium   → Suspicious patterns - Investigate when possible
+Low      → Potentially unwanted - Review for completeness
+
+================================================================================
+WORKFLOW SUMMARY
+================================================================================
+
+1. LIST:    "list sessions flagged with ekfiddle comments"
+            ↓ Get clean list sorted by severity
+
+2. REVIEW:  Identify Critical/High severity sessions
+            ↓ Note domains and threat types
+
+3. ANALYZE: "are there any malicious sessions?"
+            ↓ Auto-investigates highest severity
+
+4. CONFIRM: Review behavioral analysis
+            ✓ Does it confirm EKFiddle?
+            ✓ What patterns were found?
+
+5. REPORT:  Document findings and recommendations
+
+================================================================================
+KEY BENEFITS
+================================================================================
+
+✓ Authoritative threat intelligence (EKFiddle)
+✓ Clean, focused session lists
+✓ Automatic severity prioritization
+✓ Two-layer validation (intelligence + behavior)
+✓ Domain-level threat assessment
+✓ Efficient investigation workflow
+
+================================================================================
+WHAT MAKES THIS DIFFERENT?
+================================================================================
+
+OLD APPROACH:
+- List all sessions (overwhelming)
+- Manually check each one (time-consuming)
+- No threat intelligence (guess work)
+- High false positives (noise)
+
+NEW APPROACH WITH EKFIDDLE:
+- List ONLY flagged sessions (focused)
+- Auto-prioritize by severity (efficient)
+- Authoritative intelligence (accurate)
+- Two-layer validation (confident)
+
+================================================================================
+QUICK TROUBLESHOOTING
+================================================================================
+
+Q: No EKFiddle comments found?
+A: 1. Check EKFiddle extension is active in Fiddler
+   2. Verify Comments column shows data
+   3. Check CustomRules.js is capturing comments
+
+Q: EKFiddle says malicious but behavioral doesn't confirm?
+A: 1. Trust EKFiddle (it's threat intelligence-based)
+   2. Code might be partially captured
+   3. Sophisticated obfuscation hiding patterns
+   4. Domain-level threat vs code-level
+
+Q: Behavioral finds threats EKFiddle didn't?
+A: 1. Could be new/unknown threat
+   2. Perform deeper investigation
+   3. Check if known benign pattern
+   4. Consider submitting to EKFiddle project
+
+================================================================================
+FILES & DOCUMENTATION
+================================================================================
+
+Complete Guide: EKFIDDLE_WORKFLOW_GUIDE.md
+This Card:     EKFIDDLE_QUICK_REFERENCE.txt
+Framework:     SECURITY_ANALYSIS_FRAMEWORK.md
+General Guide: SECURITY_ANALYSIS_QUICK_REFERENCE.txt
+
+================================================================================
+EXAMPLE COMPLETE WORKFLOW
+================================================================================
+
+Step 1:
+> list sessions flagged with ekfiddle comments
+
+Result: 3 sessions found (1 Critical, 2 High)
+
+Step 2:
+> analyze the critical session
+
+Result: Session 201 analyzed
+- EKFiddle: "Critical: Known malware distribution"
+- Behavioral: CONFIRMED (iframe injection, eval(), anti-analysis)
+- Conclusion: Malware confirmed
+- Action: Block domain immediately
+
+Step 3:
+> analyze session 142
+
+Result: Session 142 analyzed (next highest priority)
+- EKFiddle: "High: JavaScript obfuscation with eval()"
+- Behavioral: CONFIRMED (eval() found, obfuscation detected)
+- Conclusion: Malicious code confirmed
+- Action: Block and investigate source
+
+Step 4:
+> what domains were flagged?
+
+Result: Domain summary provided
+- evil.example.org (Critical)
+- cdn.malicious-ads.com (High)
+- Recommendations for blocking
+
+================================================================================
+
+REMEMBER: EKFiddle comments are AUTHORITATIVE. Use behavioral analysis to
+CONFIRM and UNDERSTAND the threat, not to second-guess the intelligence.
+
+For detailed information, see: EKFIDDLE_WORKFLOW_GUIDE.md
+
+Version: 1.0 | Date: October 26, 2025
+================================================================================
+

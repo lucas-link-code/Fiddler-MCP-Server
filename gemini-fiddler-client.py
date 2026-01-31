@@ -421,18 +421,85 @@ class GeminiFiddlerClient:
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a specific MCP tool with progress indicator"""
-        # Correct common tool name hallucinations from LLM
+        
+        # Handle non-prefixed tool names (LLM sometimes omits fiddler_mcp__ prefix)
+        NON_PREFIXED_ALIASES = {
+            # Common non-prefixed hallucinations
+            "get_sessions": "fiddler_mcp__live_sessions",
+            "live_sessions": "fiddler_mcp__live_sessions",
+            "list_sessions": "fiddler_mcp__live_sessions",
+            "session_body": "fiddler_mcp__session_body",
+            "get_body": "fiddler_mcp__session_body",
+            "session_headers": "fiddler_mcp__session_headers",
+            "get_headers": "fiddler_mcp__session_headers",
+            "compare_sessions": "fiddler_mcp__compare_sessions",
+            "sessions_search": "fiddler_mcp__sessions_search",
+            "search_sessions": "fiddler_mcp__sessions_search",
+            "live_stats": "fiddler_mcp__live_stats",
+            "get_stats": "fiddler_mcp__live_stats",
+            "sessions_timeline": "fiddler_mcp__sessions_timeline",
+            "sessions_clear": "fiddler_mcp__sessions_clear",
+        }
+        
+        # Handle dot notation (fiddler_mcp.tool_name -> fiddler_mcp__tool_name)
+        if "." in tool_name and not tool_name.startswith("fiddler_mcp__"):
+            parts = tool_name.split(".")
+            if len(parts) == 2:
+                possible_name = f"fiddler_mcp__{parts[1]}"
+                self.log_with_timestamp(f"Auto-corrected dot notation: {tool_name} -> {possible_name}", to_console=True, prefix="[!] ")
+                tool_name = possible_name
+        
+        # Check non-prefixed aliases first
+        if tool_name in NON_PREFIXED_ALIASES:
+            corrected = NON_PREFIXED_ALIASES[tool_name]
+            self.log_with_timestamp(f"Auto-corrected non-prefixed tool: {tool_name} -> {corrected}", to_console=True, prefix="[!] ")
+            tool_name = corrected
+        
+        # Correct common tool name hallucinations from LLM (prefixed versions)
         TOOL_ALIASES = {
+            # Session body aliases
             "fiddler_mcp__session_details": "fiddler_mcp__session_body",
             "fiddler_mcp__sessions_details": "fiddler_mcp__session_body",
             "fiddler_mcp__get_session": "fiddler_mcp__session_body",
+            "fiddler_mcp__get_body": "fiddler_mcp__session_body",
+            "fiddler_mcp__body": "fiddler_mcp__session_body",
+            # Live sessions aliases
             "fiddler_mcp__list_sessions": "fiddler_mcp__live_sessions",
             "fiddler_mcp__sessions_list": "fiddler_mcp__live_sessions",
+            "fiddler_mcp__get_sessions": "fiddler_mcp__live_sessions",
+            "fiddler_mcp__sessions": "fiddler_mcp__live_sessions",
+            # Headers aliases
+            "fiddler_mcp__get_headers": "fiddler_mcp__session_headers",
+            "fiddler_mcp__headers": "fiddler_mcp__session_headers",
+            # Stats aliases
+            "fiddler_mcp__stats": "fiddler_mcp__live_stats",
+            "fiddler_mcp__get_stats": "fiddler_mcp__live_stats",
+            # Search aliases
+            "fiddler_mcp__search": "fiddler_mcp__sessions_search",
+            "fiddler_mcp__search_sessions": "fiddler_mcp__sessions_search",
+            # Compare aliases
+            "fiddler_mcp__compare": "fiddler_mcp__compare_sessions",
+            # Clear aliases
+            "fiddler_mcp__clear": "fiddler_mcp__sessions_clear",
+            # Timeline aliases
+            "fiddler_mcp__timeline": "fiddler_mcp__sessions_timeline",
         }
         if tool_name in TOOL_ALIASES:
             corrected = TOOL_ALIASES[tool_name]
             self.log_with_timestamp(f"Auto-corrected tool: {tool_name} -> {corrected}", to_console=True, prefix="[!] ")
             tool_name = corrected
+        
+        # Client-side validation: check if tool exists before calling server
+        valid_tools = [t.get("name") for t in self.available_tools if t.get("name")]
+        if tool_name not in valid_tools:
+            tool_list = "\n- ".join(valid_tools) if valid_tools else "No tools available"
+            self.log_with_timestamp(f"Invalid tool name: {tool_name}", to_console=True, prefix="[!] ")
+            return {
+                "error": f"Unknown tool: '{tool_name}'",
+                "message": f"This tool does not exist. Use ONLY these exact tool names:\n- {tool_list}",
+                "hint": "Check the tool name spelling and try again with one from the list above.",
+                "available_tools": valid_tools,
+            }
         
         # Enhanced bridge call logging
         args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
@@ -870,6 +937,18 @@ class GeminiFiddlerClient:
         descriptions.append("="*80 + "\n")
         
         return "\n".join(descriptions)
+
+    def _get_tool_names_list(self) -> str:
+        """Get compact list of available tool names for prompt reinforcement.
+        
+        This prevents LLM from inventing tool names by reminding it of exact valid names.
+        """
+        if not self.available_tools:
+            return ""
+        names = [t.get("name", "") for t in self.available_tools if t.get("name")]
+        if not names:
+            return ""
+        return "AVAILABLE TOOLS (use ONLY these exact names):\n- " + "\n- ".join(names)
 
     def build_gemini_prompt(self, user_query: str) -> str:
         """Build comprehensive prompt for Gemini"""
@@ -1524,6 +1603,9 @@ ANALYSIS REQUIREMENTS:
    - Then other high-risk suspicious sessions
    - Focus on BEHAVIOR over string content
 
+{self._get_tool_names_list()}
+
+IMPORTANT: Do NOT invent tool names. Use ONLY the tools listed above.
 If you need to call another tool, respond with JSON format: {{"tool": "tool_name", "arguments": {{...}}}}
 
 Otherwise, provide your security-focused analysis."""
@@ -1646,6 +1728,10 @@ ANALYSIS REQUIREMENTS:
    - If your analysis confirms EKFiddle: Strong threat confirmation
 
 5. Provide HOLISTIC SYNTHESIS
+
+{self._get_tool_names_list()}
+
+IMPORTANT: Do NOT invent tool names. Use ONLY the tools listed above.
 
 Questions:
 - What does this specific session's code DO (not what strings it contains)?

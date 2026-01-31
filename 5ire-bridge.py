@@ -470,7 +470,34 @@ class FiddlerBridgeClient:
             "full_size": data.get("full_size", {}),
         }
         
-        # NEW: Pass through smart extraction data if available (additive - never replaces existing fields)
+        # EKFiddle threat intelligence - extract from multiple possible fields
+        ekfiddle_comment = (
+            data.get("ekfiddle_comments") or 
+            data.get("session_flags") or 
+            data.get("ekfiddle_flags") or ""
+        ).strip()
+        result["ekfiddle_comment"] = ekfiddle_comment if ekfiddle_comment else None
+        
+        # Fetch session metadata (host, url, method, status) for context
+        try:
+            sessions_list = self.get_live_sessions(limit=500, since_minutes=360, 
+                                                   host_filter=None, status_filter=None, 
+                                                   suspicious_only=False)
+            if sessions_list.get("success"):
+                for sess in sessions_list.get("sessions", []):
+                    if str(sess.get("id")) == str(session_id):
+                        result["host"] = sess.get("host", "")
+                        result["url"] = sess.get("url", "")
+                        result["method"] = sess.get("method", "")
+                        result["status"] = sess.get("status", "")
+                        # Also get EKFiddle from session list if not in body response
+                        if not result.get("ekfiddle_comment") and sess.get("ekfiddle_comment"):
+                            result["ekfiddle_comment"] = sess.get("ekfiddle_comment")
+                        break
+        except Exception:
+            pass  # Metadata is optional, don't fail the request
+        
+        # Pass through smart extraction data if available (additive - never replaces existing fields)
         if data.get("smart_extraction_available"):
             result["smart_extraction"] = data.get("smart_extraction", {})
             result["smart_extraction_available"] = True
@@ -509,26 +536,19 @@ class FiddlerBridgeClient:
                     "content_type": result.get("content_type", ""),
                     "content_length": result.get("content_length", 0),
                     "truncated": result.get("truncated", False),
+                    # Include metadata from get_session_body (now populated there)
+                    "host": result.get("host", ""),
+                    "url": result.get("url", ""),
+                    "method": result.get("method", ""),
+                    "status": result.get("status", ""),
+                    # EKFiddle threat intelligence
+                    "ekfiddle_comment": result.get("ekfiddle_comment"),
                 }
                 
-                # NEW: Include smart extraction data if available
+                # Include smart extraction data if available
                 if result.get("smart_extraction_available"):
                     session_info["smart_extraction"] = result.get("smart_extraction", {})
                     session_info["smart_extraction_available"] = True
-                
-                # Try to get additional metadata from live_sessions
-                try:
-                    sessions_list = self.get_live_sessions(limit=500, since_minutes=360)
-                    if sessions_list.get("success"):
-                        for sess in sessions_list.get("sessions", []):
-                            if str(sess.get("id")) == str(session_id):
-                                session_info["host"] = sess.get("host", "")
-                                session_info["url"] = sess.get("url", "")
-                                session_info["method"] = sess.get("method", "")
-                                session_info["status"] = sess.get("status", 0)
-                                break
-                except Exception:
-                    pass  # Metadata is optional, don't fail the whole request
                 
                 sessions_data.append(session_info)
                 success_count += 1
@@ -928,6 +948,18 @@ def fiddler_mcp__session_body(
     - `content_type`: MIME type (e.g., application/json, text/javascript)
     - `content_length`: Size in bytes
     - `truncated`: True if response was too large (>50KB) and was cut off
+    - `host`: Domain/host of the request
+    - `url`: Full URL of the request
+    - `method`: HTTP method (GET, POST, etc.)
+    - `status`: HTTP status code
+    - `ekfiddle_comment`: EKFiddle threat intelligence (if flagged by EKFiddle)
+
+    **EKFIDDLE THREAT INTELLIGENCE**: If the session was flagged by EKFiddle,
+    the `ekfiddle_comment` field contains authoritative threat intelligence.
+    When present, use this to guide your security analysis. Common patterns:
+    - "Critical: Known malware" -> High priority threat
+    - "High: JavaScript obfuscation" -> Check for eval(), string arrays
+    - "Medium: Suspicious redirect" -> Look for window.location manipulation
 
     Set `include_binary=true` to request the entire payload (useful for large
     text responses or binary data). When enabled, the client saves the full
@@ -1007,10 +1039,16 @@ def fiddler_mcp__compare_sessions(
         - `content_length`: Size in bytes
         - `host`: Domain/host
         - `url`: Full URL
+        - `method`: HTTP method
+        - `status`: HTTP status code
+        - `ekfiddle_comment`: EKFiddle threat intelligence (if flagged)
         - `smart_extraction`: Intelligent extraction data (if smart_extract=True and file >50KB)
         - `error`: Error message (if fetch failed)
     - `count`: Number of sessions successfully fetched
     - `requested`: Number of sessions requested
+    
+    **EKFIDDLE CONTEXT**: Each session includes `ekfiddle_comment` if flagged by EKFiddle.
+    Use this authoritative threat intelligence to guide your comparative analysis.
     
     **Limits**: 
     - Minimum 2 sessions (use fiddler_mcp__session_body for single session)

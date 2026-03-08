@@ -34,9 +34,11 @@ Fiddler Classic          enhanced-bridge.py        5ire-bridge.py         Gemini
 ## Prerequisites
 
 - Windows 10/11
-- Python 3.8 or later
+- **Python 3.10 or later** (3.11 or 3.12 recommended)
 - Fiddler Classic (must be installed and run at least once)
 - Gemini API key (free tier available at https://makersuite.google.com/app/apikey)
+
+**Important:** The MCP (Model Context Protocol) package requires Python 3.10+. Older versions like Python 3.9 will not work.
 
 ## Quick Start
 
@@ -98,17 +100,20 @@ dropper scripts...
 
 ```
 fiddler-mcp/
-├── deploy-mcp.bat              # One-click setup (run this first)
-├── enhanced-bridge.py          # HTTP server, session buffer (port 8081)
-├── 5ire-bridge.py              # MCP server (FastMCP over stdin/stdout)
-├── gemini-fiddler-client.py    # Interactive Gemini chat client
-├── CustomRules.js              # Fiddler script (auto-deployed)
-├── requirements-gemini.txt     # Gemini client dependencies
-├── requirements-mcp.txt        # MCP bridge dependencies
-├── gemini-fiddler-config.json  # Generated config (API key, model)
-├── MCP_Data_Flow.md            # Data flow walkthrough
-├── MCP_Server_Guide.md         # Architecture overview
-└── MCP_TOOL_CONTRACT.md        # Tool schemas and responses
+├── deploy-mcp.bat                   # One-click setup (run this first)
+├── install-dependencies-manual.bat  # Manual dependency installer (if deploy fails)
+├── diagnose-environment.bat         # Diagnostic tool for troubleshooting
+├── enhanced-bridge.py               # HTTP server, session buffer (port 8081)
+├── 5ire-bridge.py                   # MCP server (FastMCP over stdin/stdout)
+├── gemini-fiddler-client.py         # Interactive Gemini chat client
+├── CustomRules.js                   # Fiddler script (auto-deployed)
+├── requirements-gemini.txt          # Gemini client dependencies
+├── requirements-mcp.txt             # MCP bridge dependencies
+├── gemini-fiddler-config.json       # Generated config (API key, model)
+├── TROUBLESHOOTING.txt              # Detailed troubleshooting guide
+├── MCP_Data_Flow.md                 # Data flow walkthrough
+├── MCP_Server_Guide.md              # Architecture overview
+└── MCP_TOOL_CONTRACT.md             # Tool schemas and responses
 ```
 
 ## Manual Setup
@@ -153,6 +158,24 @@ Available models:
 - `gemini-1.5-flash`
 
 ## Troubleshooting
+
+**Dependency installation failed**
+
+Quick fix: Run the manual installer
+```batch
+install-dependencies-manual.bat
+```
+
+This installs each package individually. After completion, run deploy-mcp.bat again.
+
+For diagnosis, run:
+```batch
+diagnose-environment.bat
+```
+
+This tests Python installation, pip availability, network connectivity to PyPI, package installation permissions, and antivirus interference.
+
+See TROUBLESHOOTING.txt for detailed solutions.
 
 **Port 8081 already in use**
 ```batch

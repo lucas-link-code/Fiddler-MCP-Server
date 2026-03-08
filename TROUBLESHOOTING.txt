@@ -1,0 +1,224 @@
+TROUBLESHOOTING DEPLOYMENT ISSUES
+
+Common Issue: Python Version Too Old
+
+Error message: "ERROR: Could not find a version that satisfies the requirement mcp"
+Or: "ERROR: Ignored the following versions that require a different python version"
+
+Cause: The MCP package requires Python 3.10 or later. Python 3.9 and earlier will not work.
+
+Solution:
+
+1. Check your Python version
+   python --version
+
+2. If showing 3.9 or earlier, upgrade to Python 3.10+
+   Download from: https://www.python.org/downloads/
+   RECOMMENDED: Python 3.11 or 3.12
+
+3. During installation, check "Add Python to PATH"
+
+4. Open NEW command prompt and verify
+   python --version
+   Should show 3.10 or later
+
+5. Run deploy-mcp.bat again
+
+See PYTHON_VERSION_FIX.txt for detailed instructions.
+
+Common Issue: Dependency Installation Failed
+
+When deploy-mcp.bat fails with "ERROR: Dependency Installation Failed", this indicates Python packages cannot be installed automatically.
+
+IMMEDIATE ACTIONS
+
+1. Run Diagnostic Tool
+
+   diagnose-environment.bat
+
+   This will identify the specific problem:
+   - Python installation issues
+   - pip module problems  
+   - Network connectivity failures
+   - PyPI access restrictions
+   - Permission issues
+
+2. Check Prerequisites
+
+   Python 3.8 or later must be installed:
+   - Download from https://www.python.org/downloads/
+   - During installation, CHECK "Add Python to PATH"
+   - Verify installation: python --version
+
+   pip must be functional:
+   - Test: python -m pip --version
+   - If missing: python -m ensurepip --default-pip
+
+3. Network Requirements
+
+   Internet access to PyPI is required:
+   - Test connectivity: ping pypi.org
+   - If behind corporate proxy, configure environment:
+     set HTTP_PROXY=http://proxy-address:port
+     set HTTPS_PROXY=http://proxy-address:port
+
+4. Run as Administrator
+
+   Right-click deploy-mcp.bat and select "Run as administrator"
+   - Required for installing packages to system directories
+   - Bypasses some permission restrictions
+
+MANUAL INSTALLATION WORKAROUND
+
+If automatic installation continues to fail, install dependencies manually:
+
+Step 1: Open Command Prompt as Administrator
+
+Step 2: Navigate to deployment directory
+   cd path\to\Fiddler_MCP_Server
+
+Step 3: Upgrade pip
+   python -m pip install --upgrade pip
+
+Step 4: Install each package individually
+   python -m pip install google-generativeai
+   python -m pip install rich
+   python -m pip install mcp
+   python -m pip install pydantic
+   python -m pip install Flask
+   python -m pip install requests
+
+Step 5: Verify installations
+   python -c "import google.generativeai; print('OK')"
+   python -c "import rich; print('OK')"
+   python -c "import mcp; print('OK')"
+   python -c "import pydantic; print('OK')"
+   python -c "import flask; print('OK')"
+   python -c "import requests; print('OK')"
+
+Step 6: Run deployment script again
+   deploy-mcp.bat
+
+SPECIFIC ERROR SCENARIOS
+
+Error: "No module named pip"
+Solution: python -m ensurepip --default-pip
+
+Error: "Could not find a version that satisfies the requirement"
+Solution: Check internet connection and PyPI access
+
+Error: "Permission denied"
+Solution: Run Command Prompt as Administrator
+
+Error: "SSL: CERTIFICATE_VERIFY_FAILED"
+Solution: Corporate firewall issue
+   - Contact IT department for proxy settings
+   - Or use: pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+Error: "[WinError 5] Access is denied"
+Solution: Antivirus blocking installation
+   - Temporarily disable antivirus
+   - Or add Python and pip to antivirus exclusions
+
+PYTHON INSTALLATION ISSUES
+
+Microsoft Store Python NOT Recommended
+
+If Python was installed from Microsoft Store:
+   - Uninstall it
+   - Download installer from python.org
+   - Run installer as Administrator
+   - Check "Add Python to PATH"
+   - Check "Install for all users"
+
+Multiple Python Installations
+
+Check which Python is being used:
+   where python
+
+Ensure correct Python is in PATH:
+   python --version should show 3.8 or later
+
+VERIFICATION AFTER FIX
+
+After resolving issues, verify environment:
+
+1. Run diagnostics:
+   diagnose-environment.bat
+
+2. All tests should pass
+
+3. Run deployment:
+   deploy-mcp.bat
+
+4. Deployment should complete all 6 steps successfully
+
+STILL HAVING ISSUES
+
+If deployment continues to fail after trying all solutions:
+
+1. Capture full diagnostic output:
+   diagnose-environment.bat > diagnostic-report.txt
+
+2. Capture deployment error output:
+   deploy-mcp.bat > deployment-error.txt 2>&1
+
+3. Include both files when requesting support
+
+4. Also provide:
+   - Windows version: winver
+   - Python version: python --version
+   - pip version: python -m pip --version
+   - Network environment: corporate, home, VPN
+
+ALTERNATIVE MINIMAL SETUP
+
+If all else fails, manual minimal setup:
+
+1. Install packages manually as shown above
+
+2. Create config file manually:
+   Copy gemini-fiddler-config.json.example to gemini-fiddler-config.json
+   Edit and add your Gemini API key
+
+3. Copy CustomRules.js manually:
+   Copy CustomRules.js to C:\Users\YourName\Documents\Fiddler2\Scripts\
+
+4. Start services manually:
+   
+   Terminal 1:
+   python enhanced-bridge.py
+   
+   Terminal 2:
+   python gemini-fiddler-client.py
+
+5. In Fiddler: Rules menu > Reload Script
+
+SUCCESS INDICATORS
+
+Deployment successful when:
+- Three console windows open
+- Enhanced Bridge shows "Running on http://127.0.0.1:8081"
+- Gemini Client shows prompt: "You:"
+- Fiddler Rules menu shows "Send to Gemini" option
+
+MAINTENANCE
+
+After successful deployment:
+
+Updating packages:
+   python -m pip install --upgrade google-generativeai rich mcp pydantic Flask requests
+
+Checking for issues:
+   diagnose-environment.bat
+
+Reconfiguring:
+   Edit gemini-fiddler-config.json
+   Restart services
+
+CONTACT
+
+For additional support:
+- Check README.md for detailed documentation
+- Review error messages in diagnostic output
+- Ensure all prerequisites are met before requesting help

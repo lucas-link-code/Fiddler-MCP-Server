@@ -65,9 +65,21 @@ echo.
 
 REM Step 3: Install dependencies
 echo [3/6] Installing Python dependencies...
+echo    Checking if dependencies are already installed...
+python -c "import google.generativeai, rich, mcp, pydantic, flask, requests" >nul 2>&1
+if not errorlevel 1 (
+    echo [+] All dependencies already installed, skipping installation
+    echo.
+    goto :SKIP_DEPS_INSTALL
+)
+echo    This may take a few minutes on first run...
+echo.
+call :PREFLIGHT_CHECK
+if errorlevel 1 goto :ERROR_PREFLIGHT_FAILED
 call :INSTALL_DEPS
 if errorlevel 1 goto :ERROR_DEPS_FAILED
-echo [+] All dependencies installed
+:SKIP_DEPS_INSTALL
+echo [+] All dependencies ready
 echo.
 
 REM Step 4: Configuration wizard
@@ -121,7 +133,7 @@ exit /b 0
 
 REM ============================================================================
 REM SUBROUTINE: CHECK_PYTHON
-REM Checks if Python 3.8+ is installed and accessible
+REM Checks if Python 3.10+ is installed and accessible
 REM ============================================================================
 :CHECK_PYTHON
 python --version >nul 2>&1
@@ -138,11 +150,11 @@ for /f "tokens=1,2 delims=." %%a in ("%PYTHON_VERSION%") do (
     set PYTHON_MINOR=%%b
 )
 
-REM Check if Python 3.8+
+REM Check if Python 3.10+
 if %PYTHON_MAJOR% LSS 3 (
     exit /b 1
 )
-if %PYTHON_MAJOR% EQU 3 if %PYTHON_MINOR% LSS 8 (
+if %PYTHON_MAJOR% EQU 3 if %PYTHON_MINOR% LSS 10 (
     exit /b 1
 )
 
@@ -237,32 +249,126 @@ if not exist "%FIDDLER_SCRIPTS_PATH%\" (
 exit /b 0
 
 REM ============================================================================
+REM SUBROUTINE: PREFLIGHT_CHECK
+REM Validates environment before attempting package installation
+REM ============================================================================
+:PREFLIGHT_CHECK
+echo    Running pre-flight checks...
+
+echo    [1/3] Checking pip availability...
+python -m pip --version >nul 2>&1
+if errorlevel 1 (
+    echo    ERROR: pip module not found
+    echo           Attempting to bootstrap pip...
+    python -m ensurepip --default-pip
+    if errorlevel 1 (
+        echo    FAILED: Cannot initialize pip
+        exit /b 1
+    )
+    echo    SUCCESS: pip initialized
+)
+
+echo    [2/3] Testing PyPI connectivity...
+python -m pip search pip --disable-pip-version-check >nul 2>&1
+if errorlevel 1 (
+    echo    WARNING: Cannot reach PyPI using search
+    echo             Attempting basic connectivity test...
+    python -m pip index versions pip --disable-pip-version-check >nul 2>&1
+    if errorlevel 1 (
+        echo    WARNING: PyPI connectivity may be limited
+        echo             Installation will be attempted anyway
+        echo.
+        set /p CONTINUE="    Continue? [Y/N]: "
+        if /i not "!CONTINUE!"=="Y" exit /b 1
+    )
+)
+
+echo    [3/3] Checking write permissions...
+echo test > "%TEMP%\mcp_deploy_test.tmp" 2>nul
+if errorlevel 1 (
+    echo    WARNING: Limited write permissions detected
+    echo             You may need to run as Administrator
+    echo.
+    set /p CONTINUE="    Continue? [Y/N]: "
+    if /i not "!CONTINUE!"=="Y" exit /b 1
+) else (
+    del "%TEMP%\mcp_deploy_test.tmp" >nul 2>&1
+)
+
+echo    Pre-flight checks completed
+echo.
+exit /b 0
+
+REM ============================================================================
 REM SUBROUTINE: INSTALL_DEPS
 REM Installs required Python packages
 REM ============================================================================
 :INSTALL_DEPS
-echo    Upgrading pip...
-python -m pip install --upgrade pip >nul 2>&1
+echo    Testing pip availability...
+python -m pip --version >nul 2>&1
+if errorlevel 1 (
+    echo    ERROR: pip is not available
+    echo           Attempting to install pip...
+    python -m ensurepip --default-pip
+    if errorlevel 1 (
+        echo    ERROR: Could not install pip
+        echo           Please install pip manually or reinstall Python
+        exit /b 1
+    )
+)
 
+echo    Upgrading pip...
+python -m pip install --upgrade pip
+if errorlevel 1 (
+    echo    WARNING: Failed to upgrade pip, continuing with current version...
+)
+
+echo.
 echo    Installing Gemini dependencies...
 if exist "%~dp0requirements-gemini.txt" (
-    python -m pip install -q -r "%~dp0requirements-gemini.txt"
+    echo    Using requirements-gemini.txt
+    python -m pip install -r "%~dp0requirements-gemini.txt"
+    set DEPS_RESULT=!ERRORLEVEL!
 ) else (
-    python -m pip install -q google-generativeai rich
+    echo    Installing: google-generativeai rich
+    python -m pip install google-generativeai rich
+    set DEPS_RESULT=!ERRORLEVEL!
 )
-if errorlevel 1 exit /b 1
+if !DEPS_RESULT! NEQ 0 (
+    echo.
+    echo    ERROR: Failed to install Gemini dependencies
+    echo           Exit code: !DEPS_RESULT!
+    exit /b 1
+)
 
+echo.
 echo    Installing MCP dependencies...
 if exist "%~dp0requirements-mcp.txt" (
-    python -m pip install -q -r "%~dp0requirements-mcp.txt"
+    echo    Using requirements-mcp.txt
+    python -m pip install -r "%~dp0requirements-mcp.txt"
+    set DEPS_RESULT=!ERRORLEVEL!
 ) else (
-    python -m pip install -q mcp pydantic requests
+    echo    Installing: mcp pydantic Flask requests
+    python -m pip install mcp pydantic Flask requests
+    set DEPS_RESULT=!ERRORLEVEL!
 )
-if errorlevel 1 exit /b 1
+if !DEPS_RESULT! NEQ 0 (
+    echo.
+    echo    ERROR: Failed to install MCP dependencies
+    echo           Exit code: !DEPS_RESULT!
+    exit /b 1
+)
 
-echo    Installing bridge dependencies...
-python -m pip install -q Flask requests
-if errorlevel 1 exit /b 1
+echo.
+echo    Verifying installations...
+python -c "import google.generativeai; import rich; import mcp; import pydantic; import flask; import requests; print('All packages verified')"
+if errorlevel 1 (
+    echo    WARNING: Some packages failed to import
+    echo             The system may not work correctly
+    echo.
+    set /p CONTINUE_ANYWAY="    Continue anyway? [Y/N]: "
+    if /i not "!CONTINUE_ANYWAY!"=="Y" exit /b 1
+)
 
 exit /b 0
 
@@ -562,18 +668,30 @@ REM ============================================================================
 :ERROR_PYTHON_NOT_FOUND
 cls
 echo ============================================================================
-echo   ERROR: Python Not Found
+echo   ERROR: Python Not Found or Version Too Old
 echo ============================================================================
 echo.
-echo This script requires Python 3.8 or later.
+echo This script requires Python 3.10 or later.
+echo.
+echo The MCP (Model Context Protocol) package requires Python 3.10+
+echo and will not work with older versions.
+echo.
+echo Current Python version detected: %PYTHON_VERSION%
+echo Required: Python 3.10 or later
 echo.
 echo Download Python from:
 echo   https://www.python.org/downloads/
 echo.
+echo RECOMMENDED: Python 3.11 or 3.12
+echo.
 echo Installation tips:
 echo   1. Download Python 3.11 or 3.12 (recommended)
 echo   2. During installation, check "Add Python to PATH"
-echo   3. Restart this script after installation
+echo   3. If you have multiple Python versions, ensure 3.10+ is first in PATH
+echo   4. Restart this script after installation
+echo.
+echo To check your Python version:
+echo   python --version
 echo.
 echo ============================================================================
 pause
@@ -600,6 +718,44 @@ echo ===========================================================================
 pause
 exit /b 1
 
+:ERROR_PREFLIGHT_FAILED
+cls
+echo ============================================================================
+echo   ERROR: Pre-flight Check Failed
+echo ============================================================================
+echo.
+echo The environment is not ready for package installation.
+echo.
+echo TROUBLESHOOTING:
+echo.
+echo   1. VERIFY PYTHON INSTALLATION:
+echo      python --version
+echo      python -m pip --version
+echo.
+echo   2. CHECK INTERNET CONNECTION:
+echo      ping pypi.org
+echo      ping 8.8.8.8
+echo.
+echo   3. TEST MANUAL PIP INSTALL:
+echo      python -m pip install --upgrade pip
+echo.
+echo   4. CHECK PROXY SETTINGS:
+echo      If behind corporate proxy, configure:
+echo      set HTTP_PROXY=http://proxy:port
+echo      set HTTPS_PROXY=http://proxy:port
+echo.
+echo   5. PYTHON INSTALLATION ISSUES:
+echo      - If Python installed via Microsoft Store, uninstall and use python.org
+echo      - Ensure "Add Python to PATH" was checked during installation
+echo      - Try reinstalling Python with admin rights
+echo.
+echo   6. RUN AS ADMINISTRATOR:
+echo      Right-click deploy-mcp.bat and select "Run as administrator"
+echo.
+echo ============================================================================
+pause
+exit /b 1
+
 :ERROR_DEPS_FAILED
 cls
 echo ============================================================================
@@ -608,14 +764,30 @@ echo ===========================================================================
 echo.
 echo Failed to install required Python packages.
 echo.
-echo Try installing manually:
+echo QUICK FIX OPTIONS:
+echo.
+echo   Option 1: Run the manual installer (RECOMMENDED)
+echo   install-dependencies-manual.bat
+echo.
+echo   This installs each package individually with full visibility.
+echo   After it completes, run deploy-mcp.bat again.
+echo.
+echo   Option 2: Run diagnostics to identify the issue
+echo   diagnose-environment.bat
+echo.
+echo   This will test Python, pip, network, and permissions.
+echo.
+echo   Option 3: Install manually in a new Administrator command prompt
 echo   python -m pip install google-generativeai rich mcp pydantic Flask requests
 echo.
-echo Common causes:
+echo COMMON CAUSES:
 echo   - No internet connection
-echo   - Insufficient permissions (try running as Administrator)
-echo   - Outdated pip (run: python -m pip install --upgrade pip)
 echo   - Corporate firewall blocking PyPI
+echo   - Insufficient permissions
+echo   - Python from Microsoft Store (use python.org installer instead)
+echo   - Antivirus blocking pip
+echo.
+echo For detailed troubleshooting, see TROUBLESHOOTING.txt
 echo.
 echo ============================================================================
 pause

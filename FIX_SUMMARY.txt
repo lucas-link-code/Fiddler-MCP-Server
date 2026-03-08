@@ -1,0 +1,171 @@
+DEPLOYMENT ERROR FIX - Quick Reference
+
+Problem
+
+Your deploy-mcp.bat script failed with "ERROR: Dependency Installation Failed" when attempting to install Python packages in Windows 10 VM.
+
+Root Cause
+
+The original script was running pip install with quiet mode and suppressed error output, making it impossible to diagnose failures. Additionally, there were no pre-flight checks to validate the environment before attempting installation.
+
+Solution Applied
+
+The deployment script has been completely rewritten with:
+
+1. Verbose installation output (no more quiet mode)
+2. Pre-flight environment validation
+3. Individual error handling for each package group
+4. Post-installation verification
+5. Better error messages with actionable solutions
+
+New Tools Created
+
+1. install-dependencies-manual.bat
+   Run this to install packages one by one with full visibility.
+   Use this as your first attempt to fix the issue.
+
+2. diagnose-environment.bat
+   Run this to identify exactly what is wrong with your environment.
+   Tests 10 different aspects (Python, pip, network, permissions, etc.)
+
+3. TROUBLESHOOTING.txt
+   Complete troubleshooting guide covering all common scenarios.
+
+What To Do Now
+
+Step 1: Try the manual installer
+
+   install-dependencies-manual.bat
+
+   This will install each package individually and show exactly where it fails.
+   If this succeeds, run deploy-mcp.bat again and it will skip to configuration.
+
+Step 2: If manual installer fails, run diagnostics
+
+   diagnose-environment.bat
+
+   This will show you exactly what is wrong:
+   - Python installation issues
+   - pip problems
+   - Network connectivity
+   - Firewall blocking PyPI
+   - Permission issues
+   - Antivirus interference
+
+Step 3: Fix the identified issue
+
+   Follow the solutions provided by the diagnostic tool.
+   Common fixes:
+   - Run as Administrator
+   - Configure corporate proxy settings
+   - Enable internet access
+   - Disable antivirus temporarily
+   - Reinstall Python (avoid Microsoft Store version)
+
+Step 4: Run deploy-mcp.bat again
+
+   After fixing the issue, the full deployment should work.
+
+Enhanced Features
+
+The updated deploy-mcp.bat now:
+
+- Shows what packages are being installed
+- Displays actual error messages from pip
+- Checks if packages are already installed (skips reinstall)
+- Validates environment before attempting installation
+- Verifies packages can be imported after installation
+- Provides clear error messages with specific solutions
+- References the new diagnostic and manual installer tools
+
+Error Messages Now Show
+
+Instead of generic "Failed to install required Python packages":
+
+- Which specific package failed
+- The actual error code from pip
+- Links to diagnostic tool
+- Links to manual installer
+- Common causes for your specific error
+- Step-by-step solutions
+
+Testing in Your VM
+
+1. Run install-dependencies-manual.bat first
+   This is the quickest path to success
+
+2. If it succeeds, run deploy-mcp.bat
+   Should proceed directly to configuration
+
+3. If it fails, run diagnose-environment.bat
+   Will identify the specific issue
+
+4. Fix the issue and try again
+
+Expected Issues in VM Environments
+
+No Internet Connection
+   Solution: Ensure VM has network access
+   Test: ping pypi.org
+
+Corporate Proxy
+   Solution: Set environment variables:
+   set HTTP_PROXY=http://proxy:port
+   set HTTPS_PROXY=http://proxy:port
+
+Insufficient Permissions
+   Solution: Right-click batch file > Run as administrator
+
+Antivirus Blocking
+   Solution: Temporarily disable or add Python to exclusions
+
+Python Not in PATH
+   Solution: Reinstall Python with "Add to PATH" checked
+
+Files Modified
+
+deploy-mcp.bat
+- Complete rewrite of INSTALL_DEPS function
+- Added PREFLIGHT_CHECK function
+- Enhanced error handlers
+- Added dependency skip logic if already installed
+
+README.md
+- Updated troubleshooting section
+- Added new tools to file structure
+- Prioritized manual installer as first fix option
+
+Files Created
+
+install-dependencies-manual.bat
+- Step-by-step manual installation
+- Full error visibility
+- Individual package verification
+- Clear success/failure indicators
+
+diagnose-environment.bat
+- 10 comprehensive environment tests
+- Specific solutions for each failure
+- Environment summary output
+- Can save output for support
+
+TROUBLESHOOTING.txt
+- Complete troubleshooting guide
+- Organized by error type
+- Step-by-step solutions
+- Alternative minimal setup
+- Maintenance procedures
+
+DEPLOYMENT_FIXES_SUMMARY.txt
+- Technical details of all changes
+- Testing recommendations
+- Expected behavior documentation
+
+Next Action
+
+In your Windows 10 VM, run:
+
+   install-dependencies-manual.bat
+
+This is the fastest path to fixing the deployment issue.
+The script will show you exactly what is happening and where it fails if there are issues.

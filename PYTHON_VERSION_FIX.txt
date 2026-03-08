@@ -1,0 +1,157 @@
+YOUR SPECIFIC ISSUE - Python Version Too Old
+
+Current Situation
+
+Your Windows 10 VM has Python 3.9.7 installed.
+The MCP package requires Python 3.10 or later.
+
+This is why the installation fails with:
+"ERROR: Could not find a version that satisfies the requirement mcp"
+
+The error message shows all available MCP versions require Python 3.10+.
+
+Solution
+
+You must upgrade to Python 3.10 or later.
+
+RECOMMENDED: Install Python 3.11 or 3.12
+
+Step-by-Step Fix
+
+Step 1: Download Python 3.11 or 3.12
+
+Visit: https://www.python.org/downloads/
+
+Click "Download Python 3.12.x" or "Download Python 3.11.x"
+
+Step 2: Install Python
+
+IMPORTANT: During installation:
+- Check "Add Python to PATH"
+- Check "Install for all users" (if prompted)
+- You can install alongside Python 3.9 or uninstall 3.9 first
+
+Step 3: Verify Installation
+
+Open NEW Command Prompt (important - close old one first)
+
+Run: python --version
+
+Should show: Python 3.10.x or 3.11.x or 3.12.x
+
+If it still shows 3.9.7, you need to fix PATH:
+- Python 3.10+ must be listed BEFORE Python 3.9 in PATH
+- Or uninstall Python 3.9
+- Or use py launcher: py -3.11 instead of python
+
+Step 4: Run Deployment
+
+After Python 3.10+ is verified:
+
+deploy-mcp.bat
+
+Should now succeed.
+
+Alternative: Use py Launcher
+
+If you have multiple Python versions and want to keep 3.9:
+
+Windows includes py launcher that can select Python version.
+
+Instead of editing all scripts, you can:
+
+1. Verify 3.11+ is available:
+   py -3.11 --version
+
+2. If available, create wrapper script:
+
+   Create: run-with-py311.bat
+
+   Contents:
+   @echo off
+   py -3.11 enhanced-bridge.py
+
+   And similar for gemini-fiddler-client.py
+
+But EASIER solution: Just upgrade your default Python to 3.11+
+
+Why This Happened
+
+The MCP package (Model Context Protocol) is relatively new and requires modern Python features only available in Python 3.10+.
+
+The error shows all MCP versions from 0.9.1 to 1.26.0 require Python 3.10.
+There is no MCP version compatible with Python 3.9.
+
+Python Version Requirements
+
+Package Requirements:
+- google-generativeai: Works with Python 3.9 (installed successfully)
+- rich: Works with Python 3.9 (installed successfully)
+- mcp: Requires Python 3.10+ (FAILED on Python 3.9)
+- pydantic: Works with Python 3.9
+- Flask: Works with Python 3.9
+- requests: Works with Python 3.9
+
+Only MCP is blocking you, but it is required for the system to work.
+
+Checking Your Current Python
+
+To see all Python installations on your system:
+
+where python
+py --list
+
+This shows all available Python versions and their locations.
+
+If you see multiple, ensure Python 3.10+ is first in PATH.
+
+After Upgrading
+
+Once Python 3.10+ is installed and verified:
+
+1. Close all command prompts
+2. Open NEW command prompt
+3. Run: python --version (should show 3.10+)
+4. Run: deploy-mcp.bat
+5. Should now complete successfully
+
+Updated Scripts
+
+All deployment scripts have been updated to:
+- Check for Python 3.10+ (not just 3.8+)
+- Show clear error if version is too old
+- Explain MCP requirement
+- Recommend Python 3.11 or 3.12
+
+When you run deploy-mcp.bat with Python 3.9, it will now show:
+
+"ERROR: Python 3.10 or later is required
+Current version: 3.9.7
+The MCP package requires Python 3.10+"
+
+Quick Reference
+
+Current Python: 3.9.7
+Required Python: 3.10 or later
+Recommended: 3.11 or 3.12
+
+Download: https://www.python.org/downloads/
+
+Installation checklist:
+[ ] Download Python 3.11 or 3.12 installer
+[ ] Run installer as Administrator
+[ ] Check "Add Python to PATH"
+[ ] Complete installation
+[ ] Open NEW command prompt
+[ ] Verify: python --version shows 3.10+
+[ ] Run: deploy-mcp.bat
+
+Next Action
+
+1. Download Python 3.11 or 3.12 from python.org
+2. Install with "Add to PATH" checked
+3. Open new command prompt
+4. Verify: python --version
+5. Run: deploy-mcp.bat
+
+This will resolve your issue.

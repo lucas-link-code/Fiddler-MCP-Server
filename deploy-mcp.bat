@@ -416,31 +416,31 @@ if "!GEMINI_API_KEY!"=="" (
 echo.
 echo    Select Gemini model:
 echo.
-echo    RECOMMENDED (Latest and Fastest):
-echo      1. gemini-2.5-flash (RECOMMENDED - Latest)
-echo      2. gemini-2.0-flash
+echo    DEFAULT / RECOMMENDED (Gemini 3):
+echo      1. gemini-3-flash-preview (DEFAULT)
+echo      2. gemini-3.1-flash-lite
+echo      3. gemini-3.1-pro-preview
+echo      4. gemini-3.5-flash
 echo.
-echo    POWERFUL (More capable):
-echo      3. gemini-2.5-pro
-echo      4. gemini-1.5-pro
-echo.
-echo    FAST AND EFFICIENT:
-echo      5. gemini-2.5-flash-lite
-echo      6. gemini-1.5-flash
+echo    GEMINI 2.5:
+echo      5. gemini-2.5-flash
+echo      6. gemini-2.5-pro
+echo      7. gemini-2.5-flash-lite
 echo.
 set /p MODEL_CHOICE="    Select model [1]: "
 if "!MODEL_CHOICE!"=="" set MODEL_CHOICE=1
 
 REM Map choice to model name
-if "!MODEL_CHOICE!"=="1" set GEMINI_MODEL=gemini-2.5-flash
-if "!MODEL_CHOICE!"=="2" set GEMINI_MODEL=gemini-2.0-flash
-if "!MODEL_CHOICE!"=="3" set GEMINI_MODEL=gemini-2.5-pro
-if "!MODEL_CHOICE!"=="4" set GEMINI_MODEL=gemini-1.5-pro
-if "!MODEL_CHOICE!"=="5" set GEMINI_MODEL=gemini-2.5-flash-lite
-if "!MODEL_CHOICE!"=="6" set GEMINI_MODEL=gemini-1.5-flash
+if "!MODEL_CHOICE!"=="1" set GEMINI_MODEL=gemini-3-flash-preview
+if "!MODEL_CHOICE!"=="2" set GEMINI_MODEL=gemini-3.1-flash-lite
+if "!MODEL_CHOICE!"=="3" set GEMINI_MODEL=gemini-3.1-pro-preview
+if "!MODEL_CHOICE!"=="4" set GEMINI_MODEL=gemini-3.5-flash
+if "!MODEL_CHOICE!"=="5" set GEMINI_MODEL=gemini-2.5-flash
+if "!MODEL_CHOICE!"=="6" set GEMINI_MODEL=gemini-2.5-pro
+if "!MODEL_CHOICE!"=="7" set GEMINI_MODEL=gemini-2.5-flash-lite
 
-REM If invalid choice, default to gemini-2.5-flash
-if "!GEMINI_MODEL!"=="" set GEMINI_MODEL=gemini-2.5-flash
+REM If invalid choice, default to gemini-3-flash-preview
+if "!GEMINI_MODEL!"=="" set GEMINI_MODEL=gemini-3-flash-preview
 
 echo.
 set /p AUTO_SAVE="    Auto-save full response bodies to disk? [N]: "

@@ -12,8 +12,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -174,6 +176,116 @@ class TestArgSanitizer(unittest.TestCase):
             {"query": "host:cdn.apigateway.co"},
         )
         self.assertEqual(out.get("host_pattern"), "cdn.apigateway.co")
+
+    def test_filter_alias_maps_to_host_pattern(self):
+        out = self.client._sanitize_tool_arguments(
+            "fiddler_mcp__sessions_search",
+            {"filter": "apigateway.co"},
+        )
+        self.assertEqual(out.get("host_pattern"), "apigateway.co")
+        self.assertNotIn("filter", out)
+
+    def test_strips_leading_star_from_host_pattern(self):
+        out = self.client._sanitize_tool_arguments(
+            "fiddler_mcp__sessions_search",
+            {"host_pattern": "*apigateway.co"},
+        )
+        self.assertEqual(out.get("host_pattern"), "apigateway.co")
+
+
+class TestRefetchLock(unittest.TestCase):
+    def setUp(self):
+        self.client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
+        self.client._analyzed_session_ids = {"256"}
+        self.client._current_user_query = "create ekfiddle rules for session 256"
+        self.client._last_search_args = {}
+        self.client.available_tools = [{"name": "fiddler_mcp__session_body"}]
+        self.client.verbose_logging = False
+        self.client.show_progress = False
+        self.client.log_with_timestamp = MagicMock()
+
+    def test_blocks_already_analyzed_session(self):
+        result = self.client.call_tool(
+            "fiddler_mcp__session_body", {"session_id": "256"}
+        )
+        self.assertFalse(result.get("success", True))
+        self.assertTrue(result.get("already_analyzed"))
+        self.assertIn("already analyzed this query", result.get("error", ""))
+
+    def test_allows_refetch_when_user_asks_refresh(self):
+        self.client._current_user_query = "refresh session 256 body"
+        # Sanitizer + lock pass; MCP path will fail without process — stub send
+        self.client.send_mcp_request = MagicMock(
+            return_value={
+                "result": {
+                    "content": [{"type": "text", "text": '{"success": true, "session_id": "256"}'}]
+                }
+            }
+        )
+        # Prefer testing allow flag directly; call_tool MCP path varies
+        self.assertTrue(
+            self.client._user_allows_body_refetch(self.client._current_user_query)
+        )
+
+
+class TestEkfiddleRuleHelpers(unittest.TestCase):
+    def setUp(self):
+        self.client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
+        self.client.script_dir = Path(ROOT)
+        self.client.log_with_timestamp = MagicMock()
+
+    def test_validator_accepts_eth_call_rule(self):
+        line = (
+            "SourceCode\tHigh: ErrTraffic eth_call\t"
+            "method\\s*:\\s*['\\\"]eth_call['\\\"]"
+        )
+        self.assertTrue(self.client._validate_ekfiddle_rule_line(line))
+
+    def test_validator_rejects_name_regex_table(self):
+        bad_lines = [
+            "Name\tRegex\tComment\tColor",
+            "EtherHiding\t/eth_call/i\tcomment\tred",
+            "| Name | Regex | Comment |",
+        ]
+        for line in bad_lines:
+            self.assertFalse(
+                self.client._validate_ekfiddle_rule_line(line),
+                msg=f"should reject: {line!r}",
+            )
+
+    def test_extractor_pulls_tab_lines_from_prose(self):
+        text = (
+            "Here are the rules for session 256.\n\n"
+            "SourceCode\tHigh: EtherHiding eth_call\tmethod\\s*:\\s*['\\\"]eth_call['\\\"]\n"
+            "SourceCode\tHigh: Overlay max z-index\tz-index\\s*:\\s*2147483647\n"
+            "\n"
+            "Do not invent hosts.\n"
+        )
+        rules = self.client._extract_ekfiddle_rules_from_text(text)
+        self.assertEqual(len(rules), 2)
+        self.assertTrue(rules[0].startswith("SourceCode\tHigh:"))
+
+    def test_save_helper_appends_under_temp_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "generated_ekfiddle_rules.txt"
+            rules = [
+                "SourceCode\tHigh: EtherHiding eth_call\tmethod\\s*:\\s*['\\\"]eth_call['\\\"]",
+                "URI\tMed: ErrTraffic RPC host\tapigateway\\.co",
+            ]
+            path = self.client._save_ekfiddle_rules(rules, output_path=out)
+            self.assertIsNotNone(path)
+            self.assertTrue(out.exists())
+            content = out.read_text(encoding="utf-8")
+            self.assertIn("# Generated ", content)
+            self.assertIn("EtherHiding eth_call", content)
+            # Append again
+            self.client._save_ekfiddle_rules(
+                ["Headers\tLow: Cookie marker\t_cf_verified"],
+                output_path=out,
+            )
+            content2 = out.read_text(encoding="utf-8")
+            self.assertEqual(content2.count("# Generated "), 2)
+            self.assertIn("_cf_verified", content2)
 
 
 class TestAutoFetchPolicy(unittest.TestCase):

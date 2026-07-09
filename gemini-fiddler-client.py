@@ -44,18 +44,20 @@ except ImportError:
     RICH_AVAILABLE = False
 
 # Available Gemini models for selection (centralized for consistency)
+# Model IDs from https://ai.google.dev/gemini-api/docs/models (Gemini 3 / 2.5)
+DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 AVAILABLE_MODELS = {
-    "1": "gemini-3-pro",
-    "2": "gemini-2.5-flash",
-    "3": "gemini-2.0-flash",
-    "4": "gemini-2.5-pro",
-    "5": "gemini-1.5-pro",
-    "6": "gemini-2.5-flash-lite",
-    "7": "gemini-2.0-flash-lite",
-    "8": "gemini-1.5-flash",
-    "9": "gemini-1.5-flash-8b",
-    "10": "gemini-2.5-flash-preview",
-    "11": "gemini-2.0-flash-exp",
+    "1": "gemini-3-flash-preview",
+    "2": "gemini-3.1-flash-lite",
+    "3": "gemini-3.1-pro-preview",
+    "4": "gemini-3.5-flash",
+    "5": "gemini-2.5-flash",
+    "6": "gemini-2.5-pro",
+    "7": "gemini-2.5-flash-lite",
+    "8": "gemini-2.0-flash",
+    "9": "gemini-2.0-flash-lite",
+    "10": "gemini-1.5-flash",
+    "11": "gemini-1.5-pro",
 }
 
 
@@ -65,7 +67,7 @@ class GeminiFiddlerClient:
     def __init__(
         self,
         api_key: str,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = DEFAULT_GEMINI_MODEL,
         auto_save_full_bodies: bool = False,
     ):
         """Initialize client with Gemini API key"""
@@ -91,6 +93,7 @@ class GeminiFiddlerClient:
         self._bridge_process = None  # optional handle if we spawned enhanced-bridge ourselves
         self.script_dir = Path(__file__).resolve().parent
         self.bridge_url = os.environ.get("FIDDLER_BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
+        self._current_user_query = ""
         
         if RICH_AVAILABLE:
             self.console = Console()
@@ -223,21 +226,143 @@ class GeminiFiddlerClient:
         if tool_name == "fiddler_mcp__sessions_search" and "url" in args and "url_pattern" not in args:
             args["url_pattern"] = args.pop("url")
 
+        # filter / host_filter aliases often hallucinated by the model
+        if tool_name == "fiddler_mcp__sessions_search":
+            for alias in ("filter", "host_filter"):
+                if alias in args and "host_pattern" not in args:
+                    val = args.pop(alias)
+                    if isinstance(val, str) and val.strip():
+                        args["host_pattern"] = val.strip()
+                elif alias in args:
+                    args.pop(alias, None)
+
+            # Strip leading/trailing * before bridge call
+            for key in ("host_pattern", "url_pattern"):
+                if key in args and isinstance(args[key], str):
+                    pat = args[key].strip()
+                    while pat.startswith("*"):
+                        pat = pat[1:]
+                    while pat.endswith("*") and not pat.endswith(r"\*"):
+                        pat = pat[:-1]
+                    args[key] = pat.strip()
+
         allowed = self._TOOL_ARG_KEYS.get(tool_name)
         if allowed is not None:
             unknown = [k for k in list(args.keys()) if k not in allowed]
             for k in unknown:
                 args.pop(k, None)
             if unknown and not args and allowed:
+                hint = f"Valid keys for {tool_name}: {sorted(allowed)}"
+                if tool_name == "fiddler_mcp__sessions_search":
+                    hint += '. Example: {"host_pattern": "cdn.apigateway.co"} or {"content_type": "javascript"}'
                 return {
                     "success": False,
                     "error": f"No valid arguments after removing unknown keys: {unknown}",
-                    "hint": f"Valid keys for {tool_name}: {sorted(allowed)}",
+                    "hint": hint,
                     "received": arguments,
                     "_sanitize_error": True,
                 }
 
         return args
+
+    @staticmethod
+    def _user_allows_body_refetch(user_query: str) -> bool:
+        """True only when the user explicitly asks to refresh/re-analyze a body."""
+        q = (user_query or "").lower()
+        triggers = (
+            "refresh",
+            "fetch again",
+            "re-fetch",
+            "refetch",
+            "re-analyze",
+            "reanalyze",
+            "re-analyse",
+            "analyse again",
+            "analyze again",
+            "get the body again",
+            "pull the body again",
+        )
+        return any(t in q for t in triggers)
+
+    def _validate_ekfiddle_rule_line(self, line: str) -> bool:
+        """Validate one tab-separated EKFiddle CustomRegexes line."""
+        if not line or "\t" not in line:
+            return False
+        if line.lstrip().startswith("#") or line.lstrip().startswith("##"):
+            return False
+        parts = line.split("\t")
+        if len(parts) < 3:
+            return False
+        rule_type = parts[0].strip()
+        severity_name = parts[1].strip()
+        regex = parts[2].strip()
+        if rule_type not in ("IP", "URI", "SourceCode", "Headers", "Hash"):
+            return False
+        if not any(severity_name.startswith(s) for s in ("High:", "Med:", "Low:")):
+            return False
+        if len(regex) < 3:
+            return False
+        # Reject slash-wrapped /regex/i pseudo-format and Name/Regex table leftovers
+        if regex.startswith("/") and regex.rstrip().endswith(("/i", "/")):
+            return False
+        if severity_name.lower() in ("name", "regex", "comment", "color"):
+            return False
+        return True
+
+    def _extract_ekfiddle_rules_from_text(self, text: str) -> List[str]:
+        """Pull valid tab-separated EKFiddle rule lines from mixed assistant prose."""
+        if not text:
+            return []
+        rules: List[str] = []
+        seen = set()
+        # Prefer fenced blocks first, then whole text
+        chunks = [text]
+        import re
+        fences = re.findall(r"```(?:text|ekfiddle|rules)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fences:
+            chunks = fences + [text]
+        for chunk in chunks:
+            for raw in chunk.splitlines():
+                line = raw.rstrip("\n").strip()
+                if not line or line in seen:
+                    continue
+                if self._validate_ekfiddle_rule_line(line):
+                    seen.add(line)
+                    rules.append(line)
+        return rules
+
+    def _save_ekfiddle_rules(self, rules: List[str], output_path: Optional[Path] = None) -> Optional[Path]:
+        """Append validated rules to generated_ekfiddle_rules.txt with a timestamp header."""
+        if not rules:
+            return None
+        path = Path(output_path) if output_path else (self.script_dir / "generated_ekfiddle_rules.txt")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n# Generated {stamp}\n")
+                for rule in rules:
+                    fh.write(rule + "\n")
+            return path
+        except Exception as exc:
+            self.log_with_timestamp(f"Failed to save EKFiddle rules: {exc}", to_console=True, prefix="[!] ")
+            return None
+
+    def maybe_persist_ekfiddle_rules(self, assistant_text: str) -> List[str]:
+        """Extract and save EKFiddle rules from an assistant response. Returns saved lines."""
+        rules = self._extract_ekfiddle_rules_from_text(assistant_text)
+        if not rules:
+            return []
+        path = self._save_ekfiddle_rules(rules)
+        if path:
+            print(f"[+] Saved {len(rules)} EKFiddle rules to {path.name}")
+        return rules
+
+    def _finalize_assistant_response(self, text: str) -> str:
+        """Persist any EKFiddle rules found in the assistant text, then return it."""
+        if text:
+            self.maybe_persist_ekfiddle_rules(text)
+        return text
 
     def _track_analyzed_session(self, tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> None:
         """Record session IDs whose bodies were fetched in this query."""
@@ -876,6 +1001,25 @@ class GeminiFiddlerClient:
             )
             return sanitized
         arguments = sanitized
+
+        # Re-fetch lock: do not pull the same session body twice in one query
+        if tool_name == "fiddler_mcp__session_body":
+            sid = str(arguments.get("session_id", "")).strip()
+            if sid and sid in self._analyzed_session_ids:
+                if not self._user_allows_body_refetch(self._current_user_query):
+                    msg = (
+                        f"Session {sid} already analyzed this query. "
+                        "Use prior body findings. Do not re-fetch."
+                    )
+                    self.log_with_timestamp(msg, to_console=True, prefix="[!] ")
+                    return {
+                        "success": False,
+                        "error": msg,
+                        "session_id": sid,
+                        "already_analyzed": True,
+                        "hint": "Create EKFiddle rules or continue from prior findings. "
+                                "Only re-fetch if the user explicitly asks to refresh/re-analyze.",
+                    }
         
         # Enhanced bridge call logging
         args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
@@ -1528,6 +1672,38 @@ TRUST HIERARCHY for THREAT ASSESSMENT:
 
 If EKFiddle Critical/High flagged something, focus on CONFIRMING the threat type. Low flags need IOC correlation.
 
+EKFIDDLE RULE AUTHORING (when user asks for EKFiddle rules / CustomRegexes / signatures):
+This is a HARD TASK MODE. Follow exactly:
+
+1. If the user names a session ID, call fiddler_mcp__session_body for that session ONCE only if it is not already analyzed this query.
+2. Extract ONLY high-signal malicious patterns actually present in the tool results:
+   - Unique function names / JSON-RPC eth_call / method:'eth_call' / jsonrpc:'2.0'
+   - Overlay UI hijack: z-index:2147483647 with position:fixed + iframe injection
+   - Distinctive hex decode loops (parseInt(...,16) + String.fromCharCode) when unique enough
+   - Distinctive cookies (_cf_verified, _wp_perf_ok) or sendBeacon telemetry strings
+   - Domains / URIs / IPs that appear in the body or captured traffic
+3. Emit rules in EXACT tab-separated CustomRegexes schema (TABS not spaces):
+   [Type]	[Severity]: [Rule Name]	[Regex]	[Optional Comment]
+   Types: SourceCode | URI | IP | Headers | Hash
+   Severity must start with High: or Med: or Low: including the colon
+4. Write a short explanation per rule starting with The crucial pattern or The key pattern.
+5. End the answer with a plain block of ONLY the tab-separated rule lines so they can be copied into CustomRegexes.txt.
+6. STOP after delivering rules. Do NOT chase Low External Script Monitor siblings. Do NOT invent hosts not present in tool results.
+7. Do NOT refuse defensive CustomRegex generation when the user asks. Provide the rules.
+8. Do NOT emit Name/Regex/Comment/Color tables, slash-wrapped /regex/i, or markdown tables as the rule format.
+9. Prefer SourceCode rules for unique malicious JS. Use URI/IP only for IOCs observed in data.
+10. Keep regexes bounded and specific to avoid false positives and high CPU cost. Prefer distinctive literals over broad .* patterns.
+11. Do NOT write rules for NitroPack / ___mnag / text/lazyload MutationObserver unless the user explicitly asks for the Low External Script Monitor pattern.
+
+Example correct rule lines:
+SourceCode	High: ErrTraffic eth_call RPC	method\s*:\s*['\"]eth_call['\"]
+SourceCode	High: EtherHiding Fullscreen Overlay	z-index\s*:\s*2147483647.{0,120}position\s*:\s*fixed
+URI	High: ErrTraffic Delivery Host	cdn\.apigateway\.co
+
+NO INVENTED IOCs:
+- Never invent domains, IPs, cookies, or function names that did not appear in tool results or the user query.
+- If a host search returns 0, say so. Do not fabricate related infrastructure.
+
 CRITICAL INSTRUCTIONS FOR TOOL CALLING:
 1. When the user asks about Fiddler traffic, you MUST use the MCP tools listed above
 2. Prefer JSON-ONLY tool calls. If brief analysis is needed, keep it under 8 lines and put the tool JSON LAST:
@@ -1671,6 +1847,7 @@ IMPORTANT: Don't announce "I will make X calls" - just make them as needed!
 Between each call, provide brief progress: "Analyzing session X..." then continue.
 
 IMPORTANT WORKFLOW RULES:
+- When user asks for EKFiddle rules / CustomRegexes / signatures for a named session → fetch that body once if needed, emit tab-separated rules, STOP
 - When user names IOC domains → search those hosts FIRST with host_pattern before any Low EKFiddle HTML body analysis
 - When user explicitly requests COMPARISON of multiple sessions → Use fiddler_mcp__compare_sessions (efficient, one call)
 - When analyzing EKFiddle or suspicious sessions sequentially → Fetch ONE at a time with fiddler_mcp__session_body, make multiple calls
@@ -1679,6 +1856,7 @@ IMPORTANT WORKFLOW RULES:
 - DO NOT repeat previous summaries - each response should ADD NEW information only
 - Focus on user IOCs and Critical/High first; skip Low External Script Monitor until IOCs are covered
 - Never re-fetch a session body already analyzed in this query
+- Never invent hosts or IOCs not present in tool results
 - You have a limit of {self.max_followups} tool calls per user query - use them wisely
 
 PERFORMANCE OPTIMIZATION INSTRUCTIONS:
@@ -1874,6 +2052,7 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         self._analyzed_session_ids = set()
         self._last_search_args = {}
         self.clear_interrupt()
+        self._current_user_query = user_query
         
         # Add user query to history
         self.conversation_history.append({"role": "user", "content": user_query})
@@ -2006,17 +2185,17 @@ User's original question: "{user_query}"
 {self._analyzed_sessions_note()}
 
 ANALYSIS REQUIREMENTS:
-1. IOC-FIRST: If the user named specific hosts/domains/URLs, search those with host_pattern BEFORE deep-diving Low EKFiddle HTML.
-2. DISTINGUISH BETWEEN SUSPICIOUS TYPES:
-   - "Suspicious sessions" = Fiddler's internal risk assessment
-   - "EKFiddle-flagged sessions" = Sessions with ekfiddle_comment field
-   - Be CLEAR about which type you're reporting
-3. CHECK FOR EKFIDDLE COMMENTS and severity:
-   - Critical/High: investigate with session_body now
-   - Low External Script Monitor: background unless it matches user IOCs
-4. ZERO-HIT: if a host search returned 0 matches, search parent apex / url_pattern next. Do not declare clean yet.
+1. If the user asked for EKFiddle rules / CustomRegexes / signatures:
+   - Use this tool result to extract high-signal malicious patterns only
+   - Emit tab-separated rules NOW: Type	Severity: Name	Regex	Comment
+   - Types: SourceCode URI IP Headers Hash. Severity: High: Med: Low:
+   - End with a plain block of ONLY rule lines. Then STOP. No more tool calls.
+   - Do NOT invent IOCs. Do NOT write NitroPack/___mnag rules unless asked.
+2. Otherwise IOC-FIRST: search user-named hosts with host_pattern BEFORE Low EKFiddle HTML.
+3. Distinguish suspicious vs EKFiddle-flagged; Critical/High first; Low External Script Monitor last.
+4. ZERO-HIT: if a host search returned 0 matches, search parent apex / url_pattern next. Do not invent hosts.
 5. Do NOT re-fetch session bodies already listed above.
-6. If response_body contains JavaScript, check if it's obfuscated; focus on BEHAVIOR.
+6. If response_body contains JavaScript, focus on BEHAVIOR over strings.
 
 {self._get_tool_names_list()}
 
@@ -2024,7 +2203,7 @@ IMPORTANT: Do NOT invent tool names. Use ONLY the tools listed above.
 session_id must be a plain string. sessions_search has no "query" field — use host_pattern / content_type.
 If you need to call another tool, put brief findings then JSON: {{"tool": "tool_name", "arguments": {{...}}}}
 
-Otherwise, provide your security-focused analysis."""
+Otherwise, provide your security-focused analysis or EKFiddle rules."""
                 
                 # Log tool result size for context
                 tool_result_str = json.dumps(tool_result, indent=2)
@@ -2081,11 +2260,12 @@ Otherwise, provide your security-focused analysis."""
                         self.log_with_timestamp(f"Query Summary: gemini_api={total_gemini_time:.1f}s, bridge={total_bridge_time:.1f}s, total={total_time:.1f}s", to_console=False)
                         self.log_with_timestamp(f"Query Summary: tool_calls={tool_call_count}, follow_ups={followup_count}", to_console=False)
                         self.conversation_history.append({"role": "assistant", "content": current_text})
-                        return current_text
+                        return self._finalize_assistant_response(current_text)
                     
                     explanatory_text = self._extract_text_before_tool_call(current_text)
                     
                     if explanatory_text.strip():
+                        self.maybe_persist_ekfiddle_rules(explanatory_text)
                         self.conversation_history.append({"role": "assistant", "content": explanatory_text})
                         if self.use_rich and self.console:
                             self.console.print("\n[bold cyan]< Gemini:[/bold cyan]")
@@ -2130,19 +2310,21 @@ User's original question: "{user_query}"
 {self._analyzed_sessions_note()}
 
 ANALYSIS REQUIREMENTS:
-1. Continue the IOC hunt if user-named hosts are still unsearched or returned 0 hits (parent apex / url_pattern).
-2. Be clear whether this session has ekfiddle_comment; Critical/High first, Low External Script Monitor last.
-3. If obfuscated JavaScript OR Critical/High EKFiddle, run MALICIOUS PATTERN CHECKLIST:
+1. If the user asked for EKFiddle rules / CustomRegexes / signatures and you have malicious SourceCode evidence:
+   - Emit final tab-separated rules NOW and STOP. No more session hopping.
+   - Format: Type	Severity: Name	Regex	OptionalComment
+   - Do NOT invent IOCs. Do NOT target NitroPack/___mnag unless asked.
+2. Otherwise continue the IOC hunt only for user-named hosts still unsearched or 0-hit parent apex / url_pattern.
+3. Be clear on ekfiddle_comment severity; Critical/High first; Low External Script Monitor last.
+4. If obfuscated JavaScript OR Critical/High EKFiddle, run MALICIOUS PATTERN CHECKLIST:
    [ ] Iframe/Script Injection
    [ ] Redirection (window.location)
    [ ] Anti-Analysis (referrer checks, localStorage counters)
    [ ] Overlay/UI Hijacking (position:fixed, z-index)
    [ ] Dynamic Code Execution (eval, Function constructor)
-4. Focus on BEHAVIOR over string content. Correlate with EKFiddle when present.
-5. Do NOT re-fetch already analyzed session IDs listed above.
-6. Provide NEW findings only, then either:
-   - Call another tool with JSON (prefer host_pattern searches for remaining IOCs), OR
-   - Give a final synthesis if the user's question is answered.
+5. Focus on BEHAVIOR over string content. Correlate with EKFiddle when present.
+6. Do NOT re-fetch already analyzed session IDs listed above.
+7. Provide NEW findings only, then either call another tool OR give the final answer.
 
 {self._get_tool_names_list()}
 
@@ -2186,7 +2368,7 @@ If calling a tool: brief note then {{"tool": "tool_name", "arguments": {{...}}}}
                         total_time = time.time() - query_start_time
                         self.log_with_timestamp(f"Query Summary: gemini_api={total_gemini_time:.1f}s, bridge={total_bridge_time:.1f}s, total={total_time:.1f}s", to_console=False)
                         self.conversation_history.append({"role": "assistant", "content": current_text})
-                        return current_text
+                        return self._finalize_assistant_response(current_text)
                     followup_count += 1
                 
                 # Reached max follow-ups — force synthesis without dangling tool JSON
@@ -2208,6 +2390,7 @@ Latest unfinished analysis text (tool JSON removed):
 {evidence_text[:8000]}
 
 Provide a FINAL SYNTHESIS only:
+- If the user asked for EKFiddle rules, emit the best tab-separated CustomRegexes you can from evidence already gathered (Type	Severity: Name	Regex	Comment). Do not invent IOCs.
 - What was confirmed about user-named IOCs / hosts
 - What remains unsearched or unverified
 - Key security findings from sessions already analyzed
@@ -2236,7 +2419,7 @@ Do not emit any tool JSON."""
                 self.log_with_timestamp(f"Query Summary: gemini_api={total_gemini_time:.1f}s, bridge={total_bridge_time:.1f}s, total={total_time:.1f}s", to_console=False)
                 self.log_with_timestamp(f"Query Summary: tool_calls={tool_call_count}, follow_ups={followup_count}", to_console=False)
                 self.conversation_history.append({"role": "assistant", "content": current_text})
-                return current_text
+                return self._finalize_assistant_response(current_text)
             else:
                 # Direct response from Gemini (no tool needed)
                 total_time = time.time() - query_start_time
@@ -2244,7 +2427,7 @@ Do not emit any tool JSON."""
                 self.log_with_timestamp(f"Query Summary: gemini_api={total_gemini_time:.1f}s, bridge=0.0s, total={total_time:.1f}s", to_console=False)
                 self.log_with_timestamp(f"Query Summary: tool_calls=0, follow_ups=0", to_console=False)
                 self.conversation_history.append({"role": "assistant", "content": gemini_text})
-                return gemini_text
+                return self._finalize_assistant_response(gemini_text)
                 
         except KeyboardInterrupt:
             # Soft interrupt: stop this tool chain only; keep client + conversation
@@ -2433,7 +2616,7 @@ Do not emit any tool JSON."""
             marker = " <-- CURRENT" if name == self.model_name else ""
             print(f"  {num}. {name}{marker}")
         print("\nTo switch: /model <number> or /model <name>")
-        print("Example: /model 2  or  /model gemini-2.5-flash")
+        print(f"Example: /model 1  or  /model {DEFAULT_GEMINI_MODEL}")
         print("=" * 70)
 
     def change_model(self, model_identifier: str):
@@ -2500,7 +2683,7 @@ def load_config() -> Dict[str, str]:
     if api_key:
         return {
             "api_key": api_key,
-            "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            "model": os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
             "auto_save_full_bodies": os.getenv("GEMINI_AUTO_SAVE_FULL_BODIES", "false").lower() in {"1", "true", "yes", "on"},
         }
     
@@ -2524,25 +2707,23 @@ def create_config_file():
         sys.exit(1)
     
     print("\n3. Select Gemini model:")
-    print("\n   LATEST (Gemini 3):")
-    print("   1. gemini-3-pro (LATEST)")
-    print("\n   RECOMMENDED (Gemini 2.5):")
-    print("   2. gemini-2.5-flash (Fast, recommended)")
-    print("   3. gemini-2.0-flash")
-    print("\n   POWERFUL:")
-    print("   4. gemini-2.5-pro (Most capable)")
-    print("   5. gemini-1.5-pro")
-    print("\n   FAST & EFFICIENT:")
-    print("   6. gemini-2.5-flash-lite")
-    print("   7. gemini-2.0-flash-lite")
-    print("   8. gemini-1.5-flash")
-    print("   9. gemini-1.5-flash-8b")
-    print("\n   EXPERIMENTAL:")
-    print("   10. gemini-2.5-flash-preview")
-    print("   11. gemini-2.0-flash-exp")
+    print("\n   DEFAULT / RECOMMENDED (Gemini 3):")
+    print("   1. gemini-3-flash-preview (DEFAULT)")
+    print("   2. gemini-3.1-flash-lite (fast, cost efficient)")
+    print("   3. gemini-3.1-pro-preview (most capable Gemini 3)")
+    print("   4. gemini-3.5-flash (stable Gemini 3.5)")
+    print("\n   GEMINI 2.5:")
+    print("   5. gemini-2.5-flash")
+    print("   6. gemini-2.5-pro")
+    print("   7. gemini-2.5-flash-lite")
+    print("\n   LEGACY (may be deprecated):")
+    print("   8. gemini-2.0-flash")
+    print("   9. gemini-2.0-flash-lite")
+    print("   10. gemini-1.5-flash")
+    print("   11. gemini-1.5-pro")
     print("\n   Enter number (1-11) or full model name")
     
-    model_choice = input("\nModel [2 for gemini-2.5-flash]: ").strip() or "2"
+    model_choice = input(f"\nModel [1 for {DEFAULT_GEMINI_MODEL}]: ").strip() or "1"
     
     # Get model name from choice (uses centralized AVAILABLE_MODELS constant)
     if model_choice in AVAILABLE_MODELS:
@@ -2621,7 +2802,7 @@ def main():
             config = create_config_file()
         
         api_key = config.get("api_key")
-        model = config.get("model", "gemini-2.5-flash")
+        model = config.get("model", DEFAULT_GEMINI_MODEL)
         
         # Initialize client
         auto_save_bodies = config.get("auto_save_full_bodies", False)

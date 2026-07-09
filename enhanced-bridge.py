@@ -1967,8 +1967,8 @@ class EnhancedFiddlerRealtimeBridge:
                 risk_score = 0.65
                 risk_level = "MEDIUM"
             elif ekfiddle_lower.startswith("low:") or "low" in ekfiddle_lower[:20]:
-                risk_score = 0.4
-                risk_level = "MEDIUM"  # Still flag for review
+                risk_score = 0.25
+                risk_level = "LOW"  # Keep Low as LOW; still flagged via risk_flag for visibility
             
             # Additional scoring based on threat keywords
             if any(pattern in ekfiddle_lower for pattern in ['exploit', 'malware', 'trojan', 'backdoor', 'ransomware']):
@@ -1979,14 +1979,15 @@ class EnhancedFiddlerRealtimeBridge:
                 risk_level = "HIGH"
             elif any(pattern in ekfiddle_lower for pattern in ['suspicious', 'obfuscated', 'encoded', 'eval']):
                 risk_score = max(risk_score, 0.65)
-                if risk_level == "MEDIUM" and "high" in ekfiddle_lower[:20]:
+                if risk_level in ("MEDIUM", "LOW") and "high" in ekfiddle_lower[:20]:
                     risk_level = "HIGH"
             
             return {
                 "score": risk_score,
                 "level": risk_level,
                 "flag": "ekfiddle_alert",
-                "reasons": [f"EKFiddle: {ekfiddle}"]
+                "reasons": [f"EKFiddle: {ekfiddle}"],
+                "ekfiddle_comment": ekfiddle,
             }
         
         # PRIORITY 2: No EKFiddle data = NOT SUSPICIOUS
@@ -2008,8 +2009,54 @@ class EnhancedFiddlerRealtimeBridge:
             "score": risk_score,
             "level": risk_level,
             "flag": flag,
-            "reasons": reasons
+            "reasons": reasons,
+            "ekfiddle_comment": None,
         }
+
+    @staticmethod
+    def _compile_search_pattern(pattern: str):
+        """Compile host/url search pattern safely.
+
+        Supports simple * and ? wildcards. Leading/trailing * are stripped for
+        substring matching. Invalid regex falls back to escaped substring match.
+        Returns (compiled_regex_or_None, normalized_pattern, warning_or_None).
+        """
+        import re
+        if not pattern:
+            return None, "", None
+        original = pattern
+        pat = pattern.strip()
+        # Strip wrapping wildcards commonly typed by LLMs (*drpc.org, *.drpc.org)
+        while pat.startswith("*"):
+            pat = pat[1:]
+        while pat.endswith("*") and not pat.endswith(r"\*"):
+            pat = pat[:-1]
+        pat = pat.strip()
+        if not pat:
+            # Pattern was only wildcards — match everything via empty means no filter
+            return None, "", f"Pattern {original!r} reduced to empty after stripping wildcards"
+
+        warning = None
+        if original != pat:
+            warning = f"Normalized search pattern {original!r} -> {pat!r}"
+
+        # If user used glob wildcards, convert to regex; otherwise treat as literal substring
+        if "*" in pat or "?" in pat:
+            # Escape then restore wildcards
+            escaped = re.escape(pat)
+            escaped = escaped.replace(r"\*", ".*").replace(r"\?", ".")
+            try:
+                return re.compile(escaped, re.I), pat, warning
+            except re.error as exc:
+                warning = f"Invalid wildcard pattern {original!r}: {exc}; using substring fallback"
+                return re.compile(re.escape(pat), re.I), pat, warning
+
+        # Literal substring (case-insensitive)
+        try:
+            return re.compile(re.escape(pat), re.I), pat, warning
+        except re.error as exc:
+            warning = f"Pattern compile failed for {original!r}: {exc}; using plain containment"
+            return None, pat, warning
 
     def _format_session_overview(self, session: Dict[str, Any]) -> Dict[str, Any]:
         assessment = self._quick_risk_assessment(session)
@@ -2020,6 +2067,19 @@ class EnhancedFiddlerRealtimeBridge:
             display_time = datetime.utcnow().strftime("%H:%M:%S")
 
         content_type = (session.get("contentType") or "").split(";")[0]
+
+        ekfiddle_comment = (
+            assessment.get("ekfiddle_comment")
+            or (session.get("ekfiddleComments") or "").strip()
+            or (session.get("sessionFlags") or "").strip()
+            or (session.get("ekfiddleFlags") or "").strip()
+            or None
+        )
+        if not ekfiddle_comment:
+            for reason in assessment.get("reasons") or []:
+                if isinstance(reason, str) and reason.lower().startswith("ekfiddle:"):
+                    ekfiddle_comment = reason.split(":", 1)[1].strip()
+                    break
 
         return {
             "id": session.get("id"),
@@ -2036,6 +2096,8 @@ class EnhancedFiddlerRealtimeBridge:
             "risk_score": assessment.get("score"),
             "risk_level": assessment.get("level"),
             "risk_reasons": assessment.get("reasons"),
+            "ekfiddle_comment": ekfiddle_comment,
+            "ekfiddleComments": ekfiddle_comment or "",
             "received_at": received_at,
             "received_at_iso": session.get("received_at_iso")
         }
@@ -2456,8 +2518,12 @@ class EnhancedFiddlerRealtimeBridge:
                 cutoff_ts = time.time() - (since_minutes * 60) if since_minutes else None
 
                 import re
-                host_rx = re.compile(host_pat, re.I) if host_pat else None
-                url_rx  = re.compile(url_pat,  re.I) if url_pat  else None
+                host_rx, host_pat_norm, host_warn = self._compile_search_pattern(host_pat)
+                url_rx, url_pat_norm, url_warn = self._compile_search_pattern(url_pat)
+                pattern_warnings = [w for w in (host_warn, url_warn) if w]
+                # Substring fallbacks when regex is None but pattern remains
+                host_substr = host_pat_norm.lower() if host_pat_norm and host_rx is None else None
+                url_substr = url_pat_norm.lower() if url_pat_norm and url_rx is None else None
 
                 def ctype_matches(ct, want):
                     if not want: return True
@@ -2485,8 +2551,14 @@ class EnhancedFiddlerRealtimeBridge:
 
                         if cutoff_ts is not None and received_at < cutoff_ts:
                             continue
-                        if host_rx and not host_rx.search(host): continue
-                        if url_rx  and not url_rx.search(url):   continue
+                        if host_rx and not host_rx.search(host):
+                            continue
+                        if host_substr and host_substr not in host.lower():
+                            continue
+                        if url_rx and not url_rx.search(url):
+                            continue
+                        if url_substr and url_substr not in url.lower():
+                            continue
                         if method and meth != method:            continue
                         if not (status_min <= code <= status_max):   continue
                         if not (min_size  <= size <= max_size):      continue
@@ -2503,14 +2575,14 @@ class EnhancedFiddlerRealtimeBridge:
                         if len(out) >= limit:
                             break
 
-                return jsonify({
+                resp_body = {
                     "success": True,
                     "total_matched": matched_total,
                     "returned": len(out),
                     "sessions": out,
                     "query": {
-                        "host_pattern": host_pat,
-                        "url_pattern": url_pat,
+                        "host_pattern": host_pat_norm or host_pat,
+                        "url_pattern": url_pat_norm or url_pat,
                         "method": method,
                         "status_min": status_min,
                         "status_max": status_max,
@@ -2520,7 +2592,10 @@ class EnhancedFiddlerRealtimeBridge:
                         "limit": limit,
                         "since_minutes": since_minutes
                     }
-                }), 200
+                }
+                if pattern_warnings:
+                    resp_body["pattern_warnings"] = pattern_warnings
+                return jsonify(resp_body), 200
 
             except Exception as e:
                 # Return 200 with empty list on any error to avoid 500s

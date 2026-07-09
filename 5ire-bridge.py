@@ -130,6 +130,22 @@ class FiddlerBridgeClient:
         except ValueError:
             return {"raw": response.text}
 
+    @staticmethod
+    def _extract_ekfiddle_comment(session: Dict[str, Any]) -> Optional[str]:
+        """Extract EKFiddle comment from overview or raw session fields.
+
+        Prefers explicit ekfiddle_comment / ekfiddleComments, then falls back to
+        risk_reasons entries that start with 'EKFiddle:'.
+        """
+        for key in ("ekfiddle_comment", "ekfiddleComments", "sessionFlags", "ekfiddleFlags"):
+            val = session.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for reason in session.get("risk_reasons") or []:
+            if isinstance(reason, str) and reason.lower().startswith("ekfiddle:"):
+                return reason.split(":", 1)[1].strip() or reason.strip()
+        return None
+
     def request_with_retry(
         self,
         method: str,
@@ -218,9 +234,7 @@ class FiddlerBridgeClient:
             host = session.get("host", "") or ""
             unique_hosts.add(host)
             # Check for EKFiddle comments from multiple possible fields
-            ekfiddle_comment = (session.get("ekfiddleComments") or 
-                               session.get("sessionFlags") or 
-                               session.get("ekfiddleFlags") or "").strip()
+            ekfiddle_comment = self._extract_ekfiddle_comment(session)
             
             normalized_sessions.append(
                 {
@@ -241,7 +255,7 @@ class FiddlerBridgeClient:
                     "risk_score": session.get("risk_score"),
                     "risk_level": session.get("risk_level"),
                     "risk_reasons": session.get("risk_reasons", []),
-                    "ekfiddle_comment": ekfiddle_comment if ekfiddle_comment else None,
+                    "ekfiddle_comment": ekfiddle_comment,
                 }
             )
 
@@ -336,9 +350,7 @@ class FiddlerBridgeClient:
         for session in data.get("sessions", []):
             unique_hosts.add(session.get("host", ""))
             # Check for EKFiddle comments from multiple possible fields
-            ekfiddle_comment = (session.get("ekfiddleComments") or 
-                               session.get("sessionFlags") or 
-                               session.get("ekfiddleFlags") or "").strip()
+            ekfiddle_comment = self._extract_ekfiddle_comment(session)
             
             normalized_sessions.append(
                 {
@@ -359,7 +371,7 @@ class FiddlerBridgeClient:
                     "risk_score": session.get("risk_score"),
                     "risk_level": session.get("risk_level"),
                     "risk_reasons": session.get("risk_reasons", []),
-                    "ekfiddle_comment": ekfiddle_comment if ekfiddle_comment else None,
+                    "ekfiddle_comment": ekfiddle_comment,
                 }
             )
 
@@ -471,12 +483,14 @@ class FiddlerBridgeClient:
         }
         
         # EKFiddle threat intelligence - extract from multiple possible fields
-        ekfiddle_comment = (
-            data.get("ekfiddle_comments") or 
-            data.get("session_flags") or 
-            data.get("ekfiddle_flags") or ""
-        ).strip()
-        result["ekfiddle_comment"] = ekfiddle_comment if ekfiddle_comment else None
+        ekfiddle_comment = self._extract_ekfiddle_comment({
+            "ekfiddle_comment": data.get("ekfiddle_comment"),
+            "ekfiddleComments": data.get("ekfiddle_comments") or data.get("ekfiddleComments"),
+            "sessionFlags": data.get("session_flags") or data.get("sessionFlags"),
+            "ekfiddleFlags": data.get("ekfiddle_flags") or data.get("ekfiddleFlags"),
+            "risk_reasons": data.get("risk_reasons") or [],
+        })
+        result["ekfiddle_comment"] = ekfiddle_comment
         
         # Fetch session metadata (host, url, method, status) for context
         try:
@@ -816,8 +830,8 @@ def fiddler_mcp__live_sessions(
 
 @mcp.tool()
 def fiddler_mcp__sessions_search(
-    host_pattern: Annotated[Optional[str], Field(description="Substring or regex to match host names.")] = None,
-    url_pattern: Annotated[Optional[str], Field(description="Substring or regex to match URLs.")] = None,
+    host_pattern: Annotated[Optional[str], Field(description="Host substring to match (e.g. 'cdn.apigateway.co' or 'drpc.org'). Do NOT use a leading *. No 'query' parameter exists.")] = None,
+    url_pattern: Annotated[Optional[str], Field(description="URL substring to match. Do NOT use a leading *.")] = None,
     content_type: Annotated[Optional[str], Field(description="Filter by MIME hint (e.g. 'javascript', 'text/html').")] = None,
     method: Annotated[Optional[HttpMethod], Field(description="Restrict to a specific HTTP method.")] = None,
     status_min: Annotated[int, Field(description="Minimum HTTP status code.", ge=0, le=999)] = 0,
@@ -836,7 +850,12 @@ def fiddler_mcp__sessions_search(
     3. Use that `id` with fiddler_mcp__session_body to see the actual content
     
     **This tool returns metadata ONLY** (not the actual response content).
-    Each result includes: id, host, url, method, status, size, content_type.
+    Each result includes: id, host, url, method, status, size, content_type, ekfiddle_comment.
+
+    **VALID PARAMETERS ONLY:** host_pattern, url_pattern, content_type, method,
+    status_min, status_max, min_size, max_size, since_minutes, limit.
+    There is NO `query` parameter. For JS files use content_type="javascript".
+    For hosts use host_pattern="example.com" (substring; no leading *).
     
     The `content_type` parameter accepts shortcuts: "javascript", "html", "json", 
     or full MIME strings like "application/json".
@@ -844,6 +863,7 @@ def fiddler_mcp__sessions_search(
     **Common use cases:**
     - Find POST requests to a specific domain: host_pattern="sentry.io", method="POST"
     - Find JavaScript files: content_type="javascript"
+    - Find IOC host: host_pattern="cdn.apigateway.co"
     - Find failed requests: status_min=400
     - Find large responses: min_size=100000
 

@@ -84,7 +84,13 @@ class GeminiFiddlerClient:
         self.tool_timeout = int(os.environ.get("GEMINI_TOOL_TIMEOUT", "30"))  # seconds
         self.gemini_timeout = int(os.environ.get("GEMINI_API_TIMEOUT", "60"))  # seconds
         self.show_progress = os.environ.get("GEMINI_HIDE_PROGRESS", "").strip() != "1"
-        self.max_followups = int(os.environ.get("GEMINI_MAX_TOOL_CALLS", "10"))  # Maximum tool calls per query
+        self.max_followups = int(os.environ.get("GEMINI_MAX_TOOL_CALLS", "20"))  # Maximum tool calls per query
+        self._analyzed_session_ids: set = set()
+        self._last_search_args: Dict[str, Any] = {}
+        self._interrupt_requested = False
+        self._bridge_process = None  # optional handle if we spawned enhanced-bridge ourselves
+        self.script_dir = Path(__file__).resolve().parent
+        self.bridge_url = os.environ.get("FIDDLER_BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
         
         if RICH_AVAILABLE:
             self.console = Console()
@@ -99,6 +105,220 @@ class GeminiFiddlerClient:
         print(f"Initialized Gemini {model_name}")
         if not RICH_AVAILABLE:
             print("[!] Tip: Install 'rich' library for better formatting: pip install rich")
+
+    # Valid argument keys per tool (used by sanitizer)
+    _TOOL_ARG_KEYS = {
+        "fiddler_mcp__live_sessions": {"limit", "since_minutes", "host_filter", "status_filter", "suspicious_only"},
+        "fiddler_mcp__sessions_search": {
+            "host_pattern", "url_pattern", "content_type", "method",
+            "status_min", "status_max", "min_size", "max_size", "since_minutes", "limit",
+        },
+        "fiddler_mcp__session_headers": {"session_id"},
+        "fiddler_mcp__session_body": {"session_id", "include_binary", "smart_extract"},
+        "fiddler_mcp__compare_sessions": {"session_ids", "include_binary", "smart_extract"},
+        "fiddler_mcp__live_stats": set(),
+        "fiddler_mcp__sessions_timeline": {"group_by", "since_minutes", "filter_host"},
+        "fiddler_mcp__sessions_clear": {"confirm"},
+    }
+
+    @staticmethod
+    def _flatten_session_id_value(value: Any) -> Optional[str]:
+        """Coerce nested/object session_id values to a plain string."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return str(int(value))
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("session_id", "id", "value"):
+                if key in value and value[key] is not None:
+                    return GeminiFiddlerClient._flatten_session_id_value(value[key])
+            if len(value) == 1:
+                return GeminiFiddlerClient._flatten_session_id_value(next(iter(value.values())))
+        if isinstance(value, list) and len(value) == 1:
+            return GeminiFiddlerClient._flatten_session_id_value(value[0])
+        return str(value).strip() or None
+
+    def _sanitize_tool_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize common LLM argument mistakes before calling MCP tools.
+
+        Returns either sanitized args, or an error dict with success=False and
+        a correction hint (caller must not send that to MCP).
+        """
+        if not isinstance(arguments, dict):
+            return {
+                "success": False,
+                "error": "Tool arguments must be a JSON object",
+                "hint": 'Use format: {"tool": "fiddler_mcp__session_body", "arguments": {"session_id": "142"}}',
+                "_sanitize_error": True,
+            }
+
+        args = dict(arguments)
+
+        # Map id -> session_id for body/headers tools
+        if tool_name in ("fiddler_mcp__session_body", "fiddler_mcp__session_headers"):
+            if "session_id" not in args and "id" in args:
+                args["session_id"] = args.pop("id")
+            if "session_id" in args:
+                flat = self._flatten_session_id_value(args["session_id"])
+                if not flat:
+                    return {
+                        "success": False,
+                        "error": "session_id must be a string or number",
+                        "hint": 'Correct example: {"session_id": "262"}',
+                        "received": arguments,
+                        "_sanitize_error": True,
+                    }
+                args["session_id"] = flat
+
+        if tool_name == "fiddler_mcp__compare_sessions" and "session_ids" in args:
+            raw_ids = args["session_ids"]
+            if isinstance(raw_ids, (str, int)):
+                raw_ids = [raw_ids]
+            if isinstance(raw_ids, list):
+                flattened = []
+                for item in raw_ids:
+                    flat = self._flatten_session_id_value(item)
+                    if flat:
+                        flattened.append(flat)
+                args["session_ids"] = flattened
+
+        # Lucene-ish query: "content_type:javascript" / "host:cdn.apigateway.co"
+        if tool_name == "fiddler_mcp__sessions_search" and "query" in args:
+            query_val = args.pop("query")
+            if isinstance(query_val, str) and query_val.strip():
+                q = query_val.strip()
+                mapped = False
+                for field, target in (
+                    ("content_type:", "content_type"),
+                    ("host:", "host_pattern"),
+                    ("host_pattern:", "host_pattern"),
+                    ("url:", "url_pattern"),
+                    ("url_pattern:", "url_pattern"),
+                    ("method:", "method"),
+                ):
+                    if q.lower().startswith(field):
+                        args.setdefault(target, q[len(field):].strip().strip('"').strip("'"))
+                        mapped = True
+                        break
+                if not mapped:
+                    # Bare domain-like string -> host_pattern
+                    if "." in q and " " not in q and ":" not in q:
+                        args.setdefault("host_pattern", q)
+                    elif q.lower() in ("javascript", "html", "json", "css", "plain"):
+                        args.setdefault("content_type", q.lower())
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"Unknown query form: {query_val!r}. sessions_search has no 'query' parameter.",
+                            "hint": 'Use host_pattern, url_pattern, or content_type. Example: {"host_pattern": "cdn.apigateway.co"} or {"content_type": "javascript"}',
+                            "received": arguments,
+                            "_sanitize_error": True,
+                        }
+
+        # host -> host_pattern alias
+        if tool_name == "fiddler_mcp__sessions_search" and "host" in args and "host_pattern" not in args:
+            args["host_pattern"] = args.pop("host")
+        if tool_name == "fiddler_mcp__sessions_search" and "url" in args and "url_pattern" not in args:
+            args["url_pattern"] = args.pop("url")
+
+        allowed = self._TOOL_ARG_KEYS.get(tool_name)
+        if allowed is not None:
+            unknown = [k for k in list(args.keys()) if k not in allowed]
+            for k in unknown:
+                args.pop(k, None)
+            if unknown and not args and allowed:
+                return {
+                    "success": False,
+                    "error": f"No valid arguments after removing unknown keys: {unknown}",
+                    "hint": f"Valid keys for {tool_name}: {sorted(allowed)}",
+                    "received": arguments,
+                    "_sanitize_error": True,
+                }
+
+        return args
+
+    def _track_analyzed_session(self, tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Record session IDs whose bodies were fetched in this query."""
+        if not isinstance(result, dict) or result.get("success") is False:
+            return
+        if tool_name == "fiddler_mcp__session_body":
+            sid = arguments.get("session_id") or result.get("session_id") or result.get("id")
+            if sid:
+                self._analyzed_session_ids.add(str(sid))
+        elif tool_name == "fiddler_mcp__compare_sessions":
+            for sid in arguments.get("session_ids") or []:
+                self._analyzed_session_ids.add(str(sid))
+            for item in result.get("sessions") or []:
+                if isinstance(item, dict) and item.get("session_id"):
+                    self._analyzed_session_ids.add(str(item["session_id"]))
+
+    def _analyzed_sessions_note(self) -> str:
+        if not self._analyzed_session_ids:
+            return "No session bodies analyzed yet in this query."
+        ids = ", ".join(sorted(self._analyzed_session_ids, key=lambda x: int(x) if str(x).isdigit() else str(x)))
+        return f"Already analyzed session bodies this query (DO NOT re-fetch): {ids}"
+
+    def _strip_tool_json_from_text(self, text: str) -> str:
+        """Remove trailing/embedded tool-call JSON so unfinished calls are not shown as answers."""
+        if not text:
+            return text
+        explanatory = self._extract_text_before_tool_call(text)
+        return explanatory.strip() if explanatory and explanatory.strip() else text.strip()
+
+    def _should_auto_fetch_body(self, search_result: Dict[str, Any], search_args: Optional[Dict[str, Any]] = None) -> bool:
+        """Decide whether auto body fetch is appropriate for this search."""
+        args = search_args if search_args is not None else self._last_search_args
+        if not args:
+            return False
+        host_pat = (args.get("host_pattern") or "").strip()
+        url_pat = (args.get("url_pattern") or "").strip()
+        if not host_pat and not url_pat:
+            return False
+        sessions = search_result.get("sessions") or []
+        if not sessions or len(sessions) > 10:
+            return False
+        return True
+
+    @staticmethod
+    def _is_text_or_js_session(session: Dict[str, Any]) -> bool:
+        ctype = (session.get("content_type") or session.get("contentType") or "").lower()
+        url = (session.get("url") or "").lower()
+        if any(x in ctype for x in ("javascript", "ecmascript", "text/html", "application/json", "text/plain")):
+            return True
+        if any(x in ctype for x in ("video/", "audio/", "image/", "octet-stream", "mp4", "mpeg")):
+            return False
+        if url.endswith((".mp4", ".webm", ".mp3", ".png", ".jpg", ".jpeg", ".gif", ".woff", ".woff2", ".ttf")):
+            return False
+        size = session.get("size") or session.get("content_length") or session.get("contentLength") or 0
+        try:
+            if int(size) > 5_000_000:
+                return False
+        except (TypeError, ValueError):
+            pass
+        return "javascript" in url or url.endswith(".js") or "/html" in ctype
+
+    def _pick_auto_fetch_session(self, sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Prefer Critical/High EKFiddle JS/HTML, else first text/JS hit; skip media."""
+        def severity_rank(s: Dict[str, Any]) -> int:
+            comment = (s.get("ekfiddle_comment") or "") + " " + " ".join(s.get("risk_reasons") or [])
+            c = comment.lower()
+            if "critical" in c[:40] or c.strip().startswith("critical"):
+                return 0
+            if "high:" in c[:40] or " high " in f" {c[:40]}":
+                return 1
+            if s.get("risk_level") == "CRITICAL":
+                return 0
+            if s.get("risk_level") == "HIGH":
+                return 1
+            return 5
+
+        candidates = [s for s in sessions if self._is_text_or_js_session(s)]
+        if not candidates:
+            return None
+        candidates.sort(key=severity_rank)
+        return candidates[0]
 
     def log_with_timestamp(self, message: str, to_console: bool = True, prefix: str = "") -> None:
         """Log a message with timestamp to both console and log file"""
@@ -149,6 +369,152 @@ class GeminiFiddlerClient:
             return len(candidates)
         except Exception:
             return 0
+
+    def request_interrupt(self) -> None:
+        """Soft-interrupt the current tool/analysis chain without exiting the client."""
+        self._interrupt_requested = True
+
+    def clear_interrupt(self) -> None:
+        self._interrupt_requested = False
+
+    def _check_interrupt(self) -> None:
+        """Raise KeyboardInterrupt if a soft interrupt was requested mid-chain."""
+        if self._interrupt_requested:
+            self._interrupt_requested = False
+            raise KeyboardInterrupt()
+
+    def is_enhanced_bridge_healthy(self, timeout: float = 2.0) -> bool:
+        """Return True if enhanced-bridge HTTP API on bridge_url is reachable."""
+        try:
+            import urllib.request
+            url = f"{self.bridge_url}/health"
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return 200 <= getattr(resp, "status", 200) < 300
+        except Exception:
+            try:
+                import urllib.request
+                url = f"{self.bridge_url}/api/stats"
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    return 200 <= getattr(resp, "status", 200) < 300
+            except Exception:
+                return False
+
+    def _python_executable(self) -> str:
+        import platform
+        # Prefer the same interpreter running this client
+        if sys.executable:
+            return sys.executable
+        return "python" if platform.system() == "Windows" else "python3"
+
+    def _launch_script_in_new_console(self, script_name: str, title: str) -> bool:
+        """Open script_name in a new visible terminal window. Returns True on launch attempt."""
+        import platform
+        script_path = self.script_dir / script_name
+        if not script_path.exists():
+            print(f"[X] Cannot start {script_name}: not found at {script_path}")
+            return False
+
+        python_exe = self._python_executable()
+        system = platform.system()
+        try:
+            if system == "Windows":
+                # Visible CMD window, same pattern as deploy-mcp.bat
+                cmd = f'start "{title}" cmd /k "cd /d "{self.script_dir}" && "{python_exe}" "{script_path}""'
+                subprocess.Popen(cmd, shell=True, cwd=str(self.script_dir))
+            elif system == "Darwin":
+                # macOS: open a new Terminal window running the bridge
+                apple_script = (
+                    f'tell application "Terminal"\n'
+                    f'  do script "cd {self.script_dir} && {python_exe} {script_path}"\n'
+                    f'  activate\n'
+                    f'end tell'
+                )
+                subprocess.Popen(["osascript", "-e", apple_script])
+            else:
+                # Linux: try common terminal emulators, else background process
+                launched = False
+                for term in (
+                    ["gnome-terminal", "--", "bash", "-lc", f"cd '{self.script_dir}' && '{python_exe}' '{script_path}'; exec bash"],
+                    ["xterm", "-T", title, "-e", f"cd '{self.script_dir}' && '{python_exe}' '{script_path}'; bash"],
+                    ["konsole", "-e", f"bash -lc \"cd '{self.script_dir}' && '{python_exe}' '{script_path}'; exec bash\""],
+                ):
+                    try:
+                        subprocess.Popen(term)
+                        launched = True
+                        break
+                    except FileNotFoundError:
+                        continue
+                if not launched:
+                    log_path = self.script_dir / f"{script_name}.autostart.log"
+                    log_f = open(log_path, "a", encoding="utf-8", errors="replace")
+                    self._bridge_process = subprocess.Popen(
+                        [python_exe, str(script_path)],
+                        cwd=str(self.script_dir),
+                        stdout=log_f,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    print(f"[*] No GUI terminal found; started {script_name} in background (log: {log_path})")
+            print(f"[+] Launched {script_name} in a new window ({title})")
+            return True
+        except Exception as exc:
+            print(f"[X] Failed to launch {script_name}: {exc}")
+            return False
+
+    def ensure_enhanced_bridge_running(self, wait_seconds: float = 25.0) -> bool:
+        """Start enhanced-bridge.py if the HTTP bridge is not already healthy."""
+        if self.is_enhanced_bridge_healthy():
+            print(f"[+] Enhanced bridge already running at {self.bridge_url}")
+            return True
+
+        print(f"[!] Enhanced bridge not reachable at {self.bridge_url}")
+        print("[*] Starting enhanced-bridge.py automatically...")
+        if not self._launch_script_in_new_console("enhanced-bridge.py", "Fiddler MCP Bridge (Port 8081)"):
+            return False
+
+        deadline = time.time() + wait_seconds
+        dots = 0
+        while time.time() < deadline:
+            if self.is_enhanced_bridge_healthy(timeout=1.5):
+                print(f"\n[+] Enhanced bridge is healthy at {self.bridge_url}")
+                return True
+            dots = (dots + 1) % 4
+            sys.stdout.write(f"\r  Waiting for enhanced-bridge{'.' * dots}{' ' * (3 - dots)}")
+            sys.stdout.flush()
+            time.sleep(0.8)
+
+        print(f"\n[X] Timed out waiting for enhanced-bridge at {self.bridge_url}")
+        print("[!] Start it manually: python enhanced-bridge.py")
+        return False
+
+    def ensure_dependencies_running(self, mcp_server_command: Optional[List[str]] = None) -> bool:
+        """Ensure enhanced-bridge (HTTP) is up, then start 5ire-bridge as MCP child if needed.
+
+        5ire-bridge speaks MCP over stdin/stdout and must be this client's subprocess.
+        enhanced-bridge is a separate HTTP server and is opened in its own console when missing.
+        """
+        if not self.ensure_enhanced_bridge_running():
+            return False
+
+        # 5ire-bridge: start as MCP subprocess if not already running
+        if self.mcp_process is not None and self.mcp_process.poll() is None:
+            print("[+] MCP bridge (5ire-bridge.py) already attached")
+            return True
+
+        import platform
+        python_cmd = self._python_executable()
+        if mcp_server_command:
+            server_command = list(mcp_server_command)
+        else:
+            server_command = [python_cmd, str(self.script_dir / "5ire-bridge.py")]
+        # Resolve relative script path against script_dir
+        if len(server_command) >= 2 and not os.path.isabs(server_command[1]):
+            candidate = self.script_dir / server_command[1]
+            if candidate.exists():
+                server_command[1] = str(candidate)
+
+        self.start_mcp_server(server_command)
+        return True
 
     def start_mcp_server(self, server_command: List[str]):
         """Start the MCP server (5ire-bridge.py) as subprocess"""
@@ -500,6 +866,16 @@ class GeminiFiddlerClient:
                 "hint": "Check the tool name spelling and try again with one from the list above.",
                 "available_tools": valid_tools,
             }
+
+        sanitized = self._sanitize_tool_arguments(tool_name, arguments or {})
+        if isinstance(sanitized, dict) and sanitized.get("_sanitize_error"):
+            self.log_with_timestamp(
+                f"Argument sanitize rejected for {tool_name}: {sanitized.get('error')}",
+                to_console=True,
+                prefix="[!] ",
+            )
+            return sanitized
+        arguments = sanitized
         
         # Enhanced bridge call logging
         args_str = ", ".join(f"{k}={v}" for k, v in arguments.items())
@@ -562,24 +938,26 @@ class GeminiFiddlerClient:
         
         sys.stdout.flush()
 
-        if tool_name == "fiddler_mcp__sessions_search" and result.get("success"):
-            follow_up = self._auto_fetch_session_body(result)
-            if follow_up:
-                result.setdefault("_follow_up", {})["session_body_preview"] = follow_up
-                
-                # Get metadata for better status reporting
-                metadata = follow_up.get("_auto_fetch_metadata", {})
-                note = follow_up.get("auto_note", "Session body retrieved")
-                follow_id = follow_up.get("session_id") or follow_up.get("id")
-                
-                if follow_id:
-                    status_msg = f"[+] Auto body fetch for session {follow_id}"
-                    if metadata.get("has_duplicate_ids"):
-                        status_msg += f" at {metadata.get('fetched_timestamp', 'unknown time')}"
-                    print(status_msg)
-                else:
-                    print(f"[+] Auto body fetch complete")
+        if tool_name == "fiddler_mcp__sessions_search":
+            self._last_search_args = dict(arguments or {})
+            if result.get("success") and self._should_auto_fetch_body(result, arguments):
+                follow_up = self._auto_fetch_session_body(result)
+                if follow_up:
+                    result.setdefault("_follow_up", {})["session_body_preview"] = follow_up
+                    metadata = follow_up.get("_auto_fetch_metadata", {})
+                    follow_id = follow_up.get("session_id") or follow_up.get("id")
+                    if follow_id:
+                        status_msg = f"[+] Auto body fetch for session {follow_id}"
+                        if metadata.get("has_duplicate_ids"):
+                            status_msg += f" at {metadata.get('fetched_timestamp', 'unknown time')}"
+                        print(status_msg)
+                        self._analyzed_session_ids.add(str(follow_id))
+                    else:
+                        print("[+] Auto body fetch complete")
+            elif result.get("success"):
+                print("[*] Auto body fetch skipped (broad search, media-only hits, or no host/url filter)")
 
+        self._track_analyzed_session(tool_name, arguments or {}, result if isinstance(result, dict) else {})
         return result
 
     def _parse_tool_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
@@ -616,12 +994,16 @@ class GeminiFiddlerClient:
         return result if isinstance(result, dict) else {"result": result}
 
     def _auto_fetch_session_body(self, search_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Automatically retrieve the body for the first session returned by a search."""
+        """Auto-retrieve body for a host/url-filtered text or JS hit; never media."""
         sessions = search_result.get("sessions") or []
         if not sessions:
             return None
 
-        first = sessions[0]
+        first = self._pick_auto_fetch_session(sessions)
+        if not first:
+            print("[*] Auto body fetch skipped: no text/html or javascript candidate in results")
+            return None
+
         session_id = str(first.get("id", "")).strip()
         if not session_id:
             return None
@@ -1032,10 +1414,32 @@ There are TWO types of suspicious sessions you may encounter:
 
 CRITICAL: Not all suspicious sessions have EKFiddle comments! Be VERY CLEAR about which type you're reporting to avoid confusion.
 
+IOC-FIRST INVESTIGATION RULE (HIGHEST PRIORITY):
+If the user names specific domains, hosts, URLs, or IOCs (e.g. cdn.apigateway.co, polygon.rpc.subquery.network):
+1. IMMEDIATELY search those hosts with fiddler_mcp__sessions_search using host_pattern (substring, no leading *).
+   Example: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"host_pattern": "cdn.apigateway.co", "limit": 50}}}}
+2. Do this BEFORE analyzing Low EKFiddle HTML pages on the landing site.
+3. Inspect session_body for matching IOC hosts (JS/HTML) before WordPress theme/plugin noise.
+4. ZERO-HIT PROTOCOL: if exact host returns 0 matches:
+   a) Search parent apex (e.g. subquery.network, drpc.org, apigateway.co)
+   b) Then url_pattern with the IOC string
+   c) Then live_sessions / timeline for unique hosts
+   d) Do NOT declare CLEAN after a single exact miss
+5. Do NOT invent a "query" parameter. Use host_pattern, url_pattern, or content_type only.
+
+EKFIDDLE SEVERITY GATE:
+- Critical / High: investigate NOW with session_body
+- Medium: investigate after user IOCs and Critical/High
+- Low (especially "External Script Monitor [HTML/JS]"): BACKGROUND only unless it matches user IOCs or references external loader hosts named by the user
+- Do NOT treat Low External Script Monitor as primary evidence of clickfix / EtherHiding / ErrTraffic
+
+NO REANALYSIS:
+- Never re-fetch session_body for a session ID already analyzed in this query
+- Prefer new IOC hosts and unexamined Critical/High sessions
+
 WHEN ASKED ABOUT SUSPICIOUS OR EKFIDDLE SESSIONS:
 
-1. CALL THE TOOL FIRST:
-   IMPORTANT: Use since_minutes=360 (6 hours) to capture ALL suspicious/EKFiddle sessions:
+1. IF USER NAMED IOCs: search those hosts first (see IOC-FIRST rule). Otherwise call:
    {{"tool": "fiddler_mcp__live_sessions", "arguments": {{"suspicious_only": true, "limit": 100, "since_minutes": 360}}}}
 
 2. ANALYZE AND REPORT CLEARLY:
@@ -1074,7 +1478,7 @@ WHEN ASKED ABOUT SUSPICIOUS OR EKFIDDLE SESSIONS:
 3. PRIORITIZE BY SEVERITY:
    - List Critical/High severity first
    - Then Medium
-   - Then Low (if present)
+   - Then Low (if present) — do not deep-dive Low External Script Monitor before user IOCs
    - Extract severity from EKFiddle comment (Critical, High, Medium, Low)
 
 4. EXTRACT KEY DOMAINS:
@@ -1087,14 +1491,17 @@ WHEN ASKED ABOUT SUSPICIOUS OR EKFIDDLE SESSIONS:
    ```
 
 5. SET INVESTIGATION FOCUS:
-   End with: "These EKFiddle-flagged sessions should be the PRIMARY focus of code investigation.
+   If user named IOCs, those hosts remain PRIMARY. Otherwise:
+   End with: "Critical/High EKFiddle sessions should be the PRIMARY focus.
    To analyze the code, use: fiddler_mcp__session_body with the session ID."
 
 WHEN ASKED ABOUT MALICIOUS/SUSPICIOUS SESSIONS IN FOLLOW-UP:
 If user asks "are there any malicious sessions?" or "show me suspicious traffic" AFTER you've listed EKFiddle flags:
 
-1. AUTOMATICALLY FETCH CODE from the HIGHEST SEVERITY EKFiddle-flagged session:
+1. If user previously named IOC hosts still unsearched, search those first
+2. Otherwise AUTOMATICALLY FETCH CODE from the HIGHEST SEVERITY (Critical/High) EKFiddle session:
    {{"tool": "fiddler_mcp__session_body", "arguments": {{"session_id": "<highest_severity_id>"}}}}
+3. Skip Low External Script Monitor unless it is the only signal and no user IOCs remain
 
 2. APPLY SECURITY ANALYSIS FRAMEWORK to that code
 3. CORRELATE your analysis with the EKFiddle comment
@@ -1110,25 +1517,28 @@ Common EKFiddle patterns and what to look for:
 - "suspicious domain" → Check domain reputation, TLD
 - "known malware" → Treat as HIGH PRIORITY threat
 - "exploit kit" → Advanced threat, check for CVE references
+- "External Script Monitor" (Low) → Often WP performance lazy-load; confirm against user IOCs before deep dive
 
 TRUST HIERARCHY for THREAT ASSESSMENT:
-1. HIGHEST: EKFiddle Comments (authoritative threat intelligence)
-2. HIGH: Behavioral analysis (your malicious pattern checklist)
-3. MEDIUM: Heuristics (file extensions, keywords)
-4. LOWEST: String content (easily manipulated)
+1. HIGHEST: User-supplied IOC hosts/URLs (search these first)
+2. HIGH: EKFiddle Critical/High comments
+3. MEDIUM: Behavioral analysis (malicious pattern checklist)
+4. LOWER: EKFiddle Low / heuristics
+5. LOWEST: String content (easily manipulated)
 
-If EKFiddle has flagged something, it IS suspicious - focus analysis on CONFIRMING the threat type.
+If EKFiddle Critical/High flagged something, focus on CONFIRMING the threat type. Low flags need IOC correlation.
 
 CRITICAL INSTRUCTIONS FOR TOOL CALLING:
 1. When the user asks about Fiddler traffic, you MUST use the MCP tools listed above
-2. To use a tool, respond with EXACTLY this JSON format (no markdown, no extra text, no code execution):
+2. Prefer JSON-ONLY tool calls. If brief analysis is needed, keep it under 8 lines and put the tool JSON LAST:
 {{"tool": "tool_name", "arguments": {{"param": "value"}}}}
 
 3. EXAMPLES OF CORRECT TOOL CALLS:
    - List sessions: {{"tool": "fiddler_mcp__live_sessions", "arguments": {{"limit": 50}}}}
    - Get body: {{"tool": "fiddler_mcp__session_body", "arguments": {{"session_id": "142"}}}}
    - Compare sessions: {{"tool": "fiddler_mcp__compare_sessions", "arguments": {{"session_ids": ["134", "148", "192", "194"]}}}}
-   - Search: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"host_pattern": "facebook.net"}}}}
+   - Search host: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"host_pattern": "cdn.apigateway.co"}}}}
+   - Search JS: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"content_type": "javascript"}}}}
 
 4. MAKE ONE TOOL CALL AT A TIME (not an array of calls)
 5. After each tool result, decide if another call is needed
@@ -1137,6 +1547,9 @@ CRITICAL INSTRUCTIONS FOR TOOL CALLING:
 8. DO NOT respond with [{{"tool_code": ...}}, ...] - this is an array and incorrect
 9. After receiving tool results, you can either make another tool call OR provide analysis
 10. For session IDs, always use them exactly as provided (they may be numbers or strings)
+11. session_id must be a plain string like "262", never an object
+12. sessions_search has NO "query" field — use host_pattern / url_pattern / content_type
+13. Do not use leading * in host_pattern (use "drpc.org" not "*drpc.org")
 
 MULTI-SESSION COMPARISON - NEW CAPABILITY:
 When user explicitly asks to COMPARE multiple sessions, use the fiddler_mcp__compare_sessions tool:
@@ -1258,12 +1671,14 @@ IMPORTANT: Don't announce "I will make X calls" - just make them as needed!
 Between each call, provide brief progress: "Analyzing session X..." then continue.
 
 IMPORTANT WORKFLOW RULES:
+- When user names IOC domains → search those hosts FIRST with host_pattern before any Low EKFiddle HTML body analysis
 - When user explicitly requests COMPARISON of multiple sessions → Use fiddler_mcp__compare_sessions (efficient, one call)
 - When analyzing EKFiddle or suspicious sessions sequentially → Fetch ONE at a time with fiddler_mcp__session_body, make multiple calls
 - DO NOT list "I will call session X, Y, Z..." - just make the calls as you analyze
-- After each call, provide brief analysis THEN decide if another call is needed
+- After each call, provide brief NEW findings THEN decide if another call is needed
 - DO NOT repeat previous summaries - each response should ADD NEW information only
-- Focus on HIGH risk sessions first, then MEDIUM only if user specifically asks
+- Focus on user IOCs and Critical/High first; skip Low External Script Monitor until IOCs are covered
+- Never re-fetch a session body already analyzed in this query
 - You have a limit of {self.max_followups} tool calls per user query - use them wisely
 
 PERFORMANCE OPTIMIZATION INSTRUCTIONS:
@@ -1279,6 +1694,7 @@ RESPONSE SPEED PRIORITY:
 - Analyze results efficiently  
 - Keep initial responses under 10 lines unless specifically asked for detail
 - Focus on answering the specific question asked
+- Prefer JSON-only tool calls; put any short analysis BEFORE the JSON, not after
 
 CONVERSATION CONTEXT:
 {self._format_recent_history(5)}
@@ -1454,6 +1870,11 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         # Log the new query (log file only)
         self.log_with_timestamp(f"User query: {user_query[:100]}{'...' if len(user_query) > 100 else ''}", to_console=False, prefix="Client: ")
         
+        # Reset per-query investigation state
+        self._analyzed_session_ids = set()
+        self._last_search_args = {}
+        self.clear_interrupt()
+        
         # Add user query to history
         self.conversation_history.append({"role": "user", "content": user_query})
         
@@ -1512,7 +1933,9 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
             sys.stdout.flush()
             
             start_time = time.time()
+            self._check_interrupt()
             response = self.model.generate_content(prompt)
+            self._check_interrupt()
             elapsed_ms = int((time.time() - start_time) * 1000)
             elapsed_s = elapsed_ms / 1000
             total_gemini_time += elapsed_s
@@ -1580,33 +2003,26 @@ CRITICAL: Apply the SECURITY ANALYSIS FRAMEWORK to analyze this result.
 
 User's original question: "{user_query}"
 
+{self._analyzed_sessions_note()}
+
 ANALYSIS REQUIREMENTS:
-1. DISTINGUISH BETWEEN SUSPICIOUS TYPES:
-   - "Suspicious sessions" = Fiddler's internal risk assessment (could be various reasons)
-   - "EKFiddle-flagged sessions" = Sessions with ekfiddle_comment field (specific threat intelligence)
+1. IOC-FIRST: If the user named specific hosts/domains/URLs, search those with host_pattern BEFORE deep-diving Low EKFiddle HTML.
+2. DISTINGUISH BETWEEN SUSPICIOUS TYPES:
+   - "Suspicious sessions" = Fiddler's internal risk assessment
+   - "EKFiddle-flagged sessions" = Sessions with ekfiddle_comment field
    - Be CLEAR about which type you're reporting
-
-2. CHECK FOR EKFIDDLE COMMENTS:
-   - Look for ekfiddle_comment field in EACH session
-   - If present: This is AUTHORITATIVE threat intelligence from EKFiddle
-   - If absent: Session may still be suspicious for OTHER reasons
-
-3. REPORT CLEARLY:
-   - State total suspicious sessions found
-   - State how many have EKFiddle comments specifically
-   - Example: "Found 62 suspicious sessions total. Of these, 3 have EKFiddle threat intelligence."
-
-4. If response_body contains JavaScript, check if it's obfuscated
-
-5. For security analysis, prioritize:
-   - EKFiddle-flagged sessions FIRST (if any)
-   - Then other high-risk suspicious sessions
-   - Focus on BEHAVIOR over string content
+3. CHECK FOR EKFIDDLE COMMENTS and severity:
+   - Critical/High: investigate with session_body now
+   - Low External Script Monitor: background unless it matches user IOCs
+4. ZERO-HIT: if a host search returned 0 matches, search parent apex / url_pattern next. Do not declare clean yet.
+5. Do NOT re-fetch session bodies already listed above.
+6. If response_body contains JavaScript, check if it's obfuscated; focus on BEHAVIOR.
 
 {self._get_tool_names_list()}
 
 IMPORTANT: Do NOT invent tool names. Use ONLY the tools listed above.
-If you need to call another tool, respond with JSON format: {{"tool": "tool_name", "arguments": {{...}}}}
+session_id must be a plain string. sessions_search has no "query" field — use host_pattern / content_type.
+If you need to call another tool, put brief findings then JSON: {{"tool": "tool_name", "arguments": {{...}}}}
 
 Otherwise, provide your security-focused analysis."""
                 
@@ -1622,7 +2038,9 @@ Otherwise, provide your security-focused analysis."""
                 sys.stdout.flush()
                 
                 analysis_start = time.time()
+                self._check_interrupt()
                 analysis_response = self.model.generate_content(analysis_prompt)
+                self._check_interrupt()
                 analysis_elapsed_ms = int((time.time() - analysis_start) * 1000)
                 analysis_elapsed_s = analysis_elapsed_ms / 1000
                 total_gemini_time += analysis_elapsed_s
@@ -1649,9 +2067,10 @@ Otherwise, provide your security-focused analysis."""
                 
                 # Inform user they can interrupt if needed
                 if self.show_progress:
-                    print(f"  (Model can make up to {max_followups} tool calls. Press Ctrl+C at any time to interrupt)")
+                    print(f"  (Model can make up to {max_followups} tool calls. Press Ctrl+C to stop this chain and keep chatting)")
                 
                 while followup_count < max_followups:
+                    self._check_interrupt()
                     next_tool_call = self.parse_gemini_response(current_text)
                     
                     if not next_tool_call:
@@ -1685,8 +2104,10 @@ Otherwise, provide your security-focused analysis."""
                     self.log_with_timestamp(f"Gemini Response: tool_call detected: {next_tool_name}({next_args_str})", to_console=False)
                     
                     # Execute follow-up tool with timing
+                    self._check_interrupt()
                     bridge_start = time.time()
                     next_tool_result = self.call_tool(next_tool_name, next_arguments)
+                    self._check_interrupt()
                     bridge_elapsed = time.time() - bridge_start
                     total_bridge_time += bridge_elapsed
                     tool_call_count += 1
@@ -1704,40 +2125,29 @@ Otherwise, provide your security-focused analysis."""
 
 CRITICAL: Apply SECURITY ANALYSIS FRAMEWORK. Analyze ONLY this new data. DO NOT repeat previous summary.
 
+User's original question: "{user_query}"
+
+{self._analyzed_sessions_note()}
+
 ANALYSIS REQUIREMENTS:
-1. MAINTAIN CLARITY ON SUSPICIOUS TYPES:
-   - Remember: "suspicious" doesn't always mean "EKFiddle-flagged"
-   - Be clear about whether this session has ekfiddle_comment or not
-
-2. CHECK FOR EKFIDDLE COMMENT:
-   - If ekfiddle_comment present, this confirms threat intelligence
-   - Note the EKFiddle assessment and use it to guide your analysis
-
-3. If obfuscated JavaScript detected OR EKFiddle-flagged, run MALICIOUS PATTERN CHECKLIST:
+1. Continue the IOC hunt if user-named hosts are still unsearched or returned 0 hits (parent apex / url_pattern).
+2. Be clear whether this session has ekfiddle_comment; Critical/High first, Low External Script Monitor last.
+3. If obfuscated JavaScript OR Critical/High EKFiddle, run MALICIOUS PATTERN CHECKLIST:
    [ ] Iframe/Script Injection
    [ ] Redirection (window.location)
    [ ] Anti-Analysis (referrer checks, localStorage counters)
    [ ] Overlay/UI Hijacking (position:fixed, z-index)
    [ ] Dynamic Code Execution (eval, Function constructor)
-
-3. Focus on BEHAVIOR over string content
-
-4. CORRELATE with EKFiddle:
-   - If EKFiddle says "eval()", verify eval() usage in code
-   - If EKFiddle says "obfuscation", identify obfuscation techniques
-   - If your analysis confirms EKFiddle: Strong threat confirmation
-
-5. Provide HOLISTIC SYNTHESIS
+4. Focus on BEHAVIOR over string content. Correlate with EKFiddle when present.
+5. Do NOT re-fetch already analyzed session IDs listed above.
+6. Provide NEW findings only, then either:
+   - Call another tool with JSON (prefer host_pattern searches for remaining IOCs), OR
+   - Give a final synthesis if the user's question is answered.
 
 {self._get_tool_names_list()}
 
-IMPORTANT: Do NOT invent tool names. Use ONLY the tools listed above.
-
-Questions:
-- What does this specific session's code DO (not what strings it contains)?
-- Does your behavioral analysis CONFIRM the EKFiddle assessment?
-- What are the key security findings?
-- Do you need to check ONE more session? If yes, use JSON format: {{"tool": "tool_name", "arguments": {{...}}}}. If no, provide final recommendations."""
+IMPORTANT: Do NOT invent tool names. session_id must be a plain string. No "query" param on sessions_search.
+If calling a tool: brief note then {{"tool": "tool_name", "arguments": {{...}}}}"""
                     
                     # Log follow-up prompt details
                     followup_result_str = json.dumps(next_tool_result, indent=2)
@@ -1750,7 +2160,9 @@ Questions:
                     sys.stdout.flush()
                     
                     followup_start = time.time()
+                    self._check_interrupt()
                     followup_response = self.model.generate_content(followup_prompt)
+                    self._check_interrupt()
                     followup_elapsed_ms = int((time.time() - followup_start) * 1000)
                     followup_elapsed_s = followup_elapsed_ms / 1000
                     total_gemini_time += followup_elapsed_s
@@ -1777,10 +2189,50 @@ Questions:
                         return current_text
                     followup_count += 1
                 
-                # Reached max follow-ups - log query summary
+                # Reached max follow-ups — force synthesis without dangling tool JSON
                 total_time = time.time() - query_start_time
                 self.log_with_timestamp(f"Gemini Warning: reached max follow-up limit ({max_followups})", to_console=False)
                 self.log_with_timestamp(f"Tool Chain: completed after {tool_call_count} tool calls (limit reached)", to_console=False)
+
+                pending_call = self.parse_gemini_response(current_text)
+                evidence_text = self._strip_tool_json_from_text(current_text)
+                if pending_call or (current_text and current_text != evidence_text):
+                    self.log_with_timestamp("Forcing final synthesis after tool budget exhausted", to_console=False)
+                    synthesis_prompt = f"""Tool call budget exhausted ({max_followups} calls). Do NOT request another tool.
+
+User's original question: "{user_query}"
+
+{self._analyzed_sessions_note()}
+
+Latest unfinished analysis text (tool JSON removed):
+{evidence_text[:8000]}
+
+Provide a FINAL SYNTHESIS only:
+- What was confirmed about user-named IOCs / hosts
+- What remains unsearched or unverified
+- Key security findings from sessions already analyzed
+- Clear next manual steps if evidence is incomplete
+Do not emit any tool JSON."""
+                    try:
+                        sys.stdout.write("\r  Waiting for Gemini LLM final synthesis...")
+                        sys.stdout.flush()
+                        synth_start = time.time()
+                        synth_resp = self.model.generate_content(synthesis_prompt)
+                        synth_elapsed = time.time() - synth_start
+                        total_gemini_time += synth_elapsed
+                        sys.stdout.write(f"\r  [Gemini LLM] Final synthesis complete ({synth_elapsed:.1f}s)                    \n")
+                        sys.stdout.flush()
+                        synth_text = extract_text_safe(synth_resp)
+                        if synth_text:
+                            current_text = self._strip_tool_json_from_text(synth_text)
+                        else:
+                            current_text = evidence_text or "Tool budget reached. Unable to complete further automated investigation."
+                    except Exception as synth_err:
+                        self.log_with_timestamp(f"Final synthesis failed: {synth_err}", to_console=False)
+                        current_text = evidence_text or current_text
+                else:
+                    current_text = evidence_text or current_text
+
                 self.log_with_timestamp(f"Query Summary: gemini_api={total_gemini_time:.1f}s, bridge={total_bridge_time:.1f}s, total={total_time:.1f}s", to_console=False)
                 self.log_with_timestamp(f"Query Summary: tool_calls={tool_call_count}, follow_ups={followup_count}", to_console=False)
                 self.conversation_history.append({"role": "assistant", "content": current_text})
@@ -1795,10 +2247,14 @@ Questions:
                 return gemini_text
                 
         except KeyboardInterrupt:
-            # User pressed Ctrl+C to interrupt the model
-            interrupt_msg = "\n\n[INTERRUPTED] User stopped the model's response chain. You can ask a new question or modify your prompt."
+            # Soft interrupt: stop this tool chain only; keep client + conversation
+            self.clear_interrupt()
+            interrupt_msg = (
+                "\n\n[INTERRUPTED] Stopped the current tool chain. "
+                "Conversation context is preserved. Ask a follow-up or type /quit to exit."
+            )
             print(interrupt_msg)
-            self.log_with_timestamp("User interrupted with Ctrl+C", to_console=False, prefix="Client: ")
+            self.log_with_timestamp("User interrupted tool chain with Ctrl+C (client kept alive)", to_console=False, prefix="Client: ")
             self.conversation_history.append({"role": "system", "content": "[User interrupted the response]"})
             return interrupt_msg
                 
@@ -1827,7 +2283,8 @@ Questions:
         print("  /history - Show conversation history")
         print("  /clear   - Clear conversation history")
         print("  /quit    - Exit")
-        print("\n" + "=" * 70)
+        print("\nTip: During a tool chain, Ctrl+C stops that answer only and returns to the prompt.")
+        print("=" * 70)
         
         while True:
             try:
@@ -1878,7 +2335,10 @@ Questions:
                     print(response)
                 
             except KeyboardInterrupt:
-                print("\n\nInterrupted. Type /quit to exit.")
+                # Idle prompt Ctrl+C: soft interrupt flag + stay in loop
+                self.request_interrupt()
+                self.clear_interrupt()
+                print("\n\n[!] Interrupted. Conversation kept. Type a new question or /quit to exit.")
             except Exception as e:
                 print(f"\n[X] Error: {e}")
 
@@ -2129,15 +2589,22 @@ def main():
     import signal
     
     client = None
-    
-    # Handle Ctrl+C gracefully
+    _state = {"interactive": False, "in_chat": False}
+
     def signal_handler(sig, frame):
+        """Ctrl+C during chat/tool chain: soft interrupt. Idle at prompt: stay alive.
+        Only exit the process if we are still in startup (before interactive mode).
+        """
+        if client is not None and _state["interactive"]:
+            client.request_interrupt()
+            # Raise so blocking generate_content / input() abort immediately
+            raise KeyboardInterrupt
         print("\n\n[!] Interrupted by user (Ctrl+C)")
         if client:
             print("[*] Cleaning up...")
             try:
                 client.close()
-            except:
+            except Exception:
                 pass
         print("[+] Goodbye!")
         sys.exit(0)
@@ -2164,13 +2631,17 @@ def main():
             model_name=model,
             auto_save_full_bodies=auto_save_bodies,
         )
-        
-        # Start MCP server with OS-appropriate Python command
+        if config.get("bridge_url"):
+            client.bridge_url = str(config["bridge_url"]).rstrip("/")
+
+        # Ensure enhanced-bridge (HTTP) + 5ire-bridge (MCP) are available
         python_cmd = "python" if platform.system() == "Windows" else "python3"
         server_command = config.get("mcp_server_command", [python_cmd, "5ire-bridge.py"])
-        client.start_mcp_server(server_command)
-        
-        # MCP connection is initialized in start_mcp_server
+        print("\n[*] Checking bridge dependencies...")
+        if not client.ensure_dependencies_running(server_command):
+            print("[X] Required bridges are not available. Cannot continue.")
+            print("[!] Start enhanced-bridge.py manually, then re-run this client.")
+            sys.exit(1)
         
         # List available tools with timeout
         print("[*] Discovering tools...")
@@ -2178,7 +2649,7 @@ def main():
         
         if not tools:
             print("[X] Failed to discover tools. Cannot continue.")
-            print("[!] Make sure enhanced-bridge.py is running first!")
+            print("[!] Make sure enhanced-bridge.py is running and healthy on port 8081.")
             sys.exit(1)
         
         print(f"[+] Ready with {len(tools)} tools:")
@@ -2187,19 +2658,30 @@ def main():
             print(f"    - {tool_name}")
         
         try:
-            # Run interactive mode
+            original_chat = client.chat
+
+            def chat_with_flag(user_query: str) -> str:
+                _state["in_chat"] = True
+                try:
+                    return original_chat(user_query)
+                finally:
+                    _state["in_chat"] = False
+
+            client.chat = chat_with_flag  # type: ignore[method-assign]
+            _state["interactive"] = True
             client.interactive_mode()
         finally:
-            # Cleanup
+            _state["interactive"] = False
             if client:
                 client.close()
     
     except KeyboardInterrupt:
+        # Should be rare here (startup); interactive catches its own interrupts
         print("\n\n[!] Interrupted by user")
         if client:
             try:
                 client.close()
-            except:
+            except Exception:
                 pass
         sys.exit(0)
     except Exception as e:
@@ -2207,7 +2689,7 @@ def main():
         if client:
             try:
                 client.close()
-            except:
+            except Exception:
                 pass
         sys.exit(1)
 

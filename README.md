@@ -143,7 +143,7 @@ The client prompts for your API key on first run.
 ```json
 {
   "api_key": "your-api-key",
-  "model": "gemini-2.5-flash",
+  "model": "gemini-3-flash-preview",
   "auto_save_full_bodies": false,
   "mcp_server_command": ["python", "5ire-bridge.py"],
   "bridge_url": "http://127.0.0.1:8081"
@@ -151,11 +151,11 @@ The client prompts for your API key on first run.
 ```
 
 Available models:
-- `gemini-2.5-flash` (recommended, fast)
-- `gemini-2.5-pro` (more capable)
-- `gemini-2.0-flash`
-- `gemini-1.5-pro`
-- `gemini-1.5-flash`
+- `gemini-3-flash-preview` (default)
+- `gemini-3.1-flash-lite` (fast, cost efficient)
+- `gemini-3.1-pro-preview` (most capable Gemini 3)
+- `gemini-3.5-flash` (stable Gemini 3.5)
+- `gemini-2.5-flash` / `gemini-2.5-pro` / `gemini-2.5-flash-lite`
 
 ## Troubleshooting
 

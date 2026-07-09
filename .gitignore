@@ -1,5 +1,12 @@
 # Fiddler CustomRules - excluded to prevent accidental overwrites
 CustomRules.js
 
+# Analyst-generated EKFiddle output (do not commit live rules)
+generated_ekfiddle_rules.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
 # macOS
 .DS_Store

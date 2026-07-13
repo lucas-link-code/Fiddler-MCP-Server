@@ -133,7 +133,10 @@ Commands
 /stats - Show bridge statistics
 /tools - List available tools
 /history - Show conversation history
-/clear - Clear conversation history
+/clear - Clear bridge capture buffers (live + suspicious)
+/clearchat - Clear conversation history
+/investigate - Hunt malicious traffic in the current buffer
+/investigate example.com - Same playbook, prioritize a host
 /help - Show help
 /quit - Exit
 

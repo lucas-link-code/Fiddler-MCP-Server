@@ -360,6 +360,44 @@ class TestNativeChatHelpers(unittest.TestCase):
         self.assertIn("ZERO-HIT", text)
         self.assertIn("The crucial pattern", text)
         self.assertIn("Never write Medium:", text)
+        self.assertIn("INVESTIGATE CAPTURE", text)
+        self.assertIn("Do not author CustomRegexes for confirmed FP", text)
+
+
+class TestProtoCoercion(unittest.TestCase):
+    def test_repeated_like_container_to_list(self):
+        class FakeRepeated:
+            def __init__(self, items):
+                self._items = items
+
+            def __iter__(self):
+                return iter(self._items)
+
+        # Spoof RepeatedComposite type name
+        FakeRepeated.__name__ = "RepeatedComposite"
+        out = native._proto_value_to_python(FakeRepeated(["250", "231", 41]))
+        self.assertEqual(out, ["250", "231", 41])
+        # Must be JSON serializable
+        import json
+
+        json.dumps(out)
+
+    def test_nested_map_with_repeated(self):
+        class FakeRepeated:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def __iter__(self):
+                return iter(self._items)
+
+        FakeRepeated.__name__ = "RepeatedComposite"
+        nested = {"session_ids": FakeRepeated(["250", "231"]), "smart_extract": True}
+        out = native._proto_value_to_python(nested)
+        self.assertEqual(out["session_ids"], ["250", "231"])
+        self.assertTrue(out["smart_extract"])
+        import json
+
+        json.dumps(out)
 
 
 class TestNativeChatLoop(unittest.TestCase):

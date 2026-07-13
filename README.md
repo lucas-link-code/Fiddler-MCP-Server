@@ -170,6 +170,15 @@ Environment flags:
 - `GEMINI_SKIP_DEP_INSTALL=1` — skip automatic pip install
 - `GEMINI_MAX_TOOL_CALLS` — max tool calls per query (default 20)
 
+Interactive slash commands:
+- `/clear` — clear enhanced-bridge live + suspicious capture buffers (use between cases)
+- `/clearchat` — clear conversation history only
+- `/investigate` — run the malicious-traffic playbook on the current buffer
+- `/investigate <host>` — same playbook, prioritize a host first
+- `/stats` `/tools` `/history` `/model` `/help` `/quit`
+
+During a tool chain the client prints brief breadcrumbs such as `-> session_body 250` or `-> search evil.example`. Ctrl+C stops the current chain only.
+
 ## Configuration
 
 `gemini-fiddler-config.json` (created by deploy-mcp.bat or first client run):

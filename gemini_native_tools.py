@@ -114,12 +114,19 @@ def extract_function_calls(response: Any) -> List[Dict[str, Any]]:
             if hasattr(args, "items"):
                 # MapComposite / protobuf Struct-like
                 try:
-                    args_dict = {k: _proto_value_to_python(v) for k, v in args.items()}
+                    args_dict = {str(k): _proto_value_to_python(v) for k, v in args.items()}
                 except Exception:
-                    args_dict = dict(args)
+                    try:
+                        args_dict = {str(k): _proto_value_to_python(v) for k, v in dict(args).items()}
+                    except Exception:
+                        args_dict = {}
             elif isinstance(args, dict):
-                args_dict = args
+                args_dict = {str(k): _proto_value_to_python(v) for k, v in args.items()}
             else:
+                args_dict = {}
+            # Final pass: ensure nested values are JSON-serializable
+            args_dict = _proto_value_to_python(args_dict)
+            if not isinstance(args_dict, dict):
                 args_dict = {}
             if name:
                 calls.append({"name": str(name), "args": args_dict, "raw_part": part})
@@ -129,18 +136,40 @@ def extract_function_calls(response: Any) -> List[Dict[str, Any]]:
 
 
 def _proto_value_to_python(value: Any) -> Any:
+    """Coerce Gemini protobuf / MapComposite / RepeatedComposite values to JSON-safe Python."""
     if value is None:
         return None
     if isinstance(value, (str, int, float, bool)):
         return value
-    if isinstance(value, list):
+    if isinstance(value, dict):
+        return {str(k): _proto_value_to_python(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
         return [_proto_value_to_python(v) for v in value]
     if hasattr(value, "items"):
         try:
-            return {k: _proto_value_to_python(v) for k, v in value.items()}
+            return {str(k): _proto_value_to_python(v) for k, v in value.items()}
         except Exception:
             pass
-    return value
+    type_name = type(value).__name__
+    # protobuf RepeatedComposite / RepeatedScalarContainer / MapComposite
+    if "Repeated" in type_name or type_name == "MapComposite":
+        try:
+            if hasattr(value, "items") and "Map" in type_name:
+                return {str(k): _proto_value_to_python(v) for k, v in value.items()}
+            return [_proto_value_to_python(v) for v in value]
+        except Exception:
+            pass
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            return [_proto_value_to_python(v) for v in value]
+        except Exception:
+            pass
+    # Scalar proto wrappers / leftover opaque objects
+    try:
+        json.dumps(value)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def extract_text_parts(response: Any) -> str:
@@ -285,6 +314,18 @@ SECURITY ANALYSIS FRAMEWORK:
 - Focus on BEHAVIOR in JavaScript bodies over string dumps
 - If MCP tools fail or the server is down, answer from prior conversation evidence. Do not claim you cannot explain an infection chain when bodies were already analyzed earlier in this chat
 - Low External Script Monitor does not mean benign. Elevate when SourceCode shows eth_call, RPC C2, clipboard hijack, fullscreen overlay, or etherhiding patterns
+- Prefer session_body over session_headers. Treat headers 404 as non-fatal and continue from body or search metadata
+- Skip image/video/audio bodies; pick JS/HTML/JSON sessions for malware analysis
+- When calling tools you may emit at most one very short thought line. The client prints its own status breadcrumbs; do not narrate every tool
+
+INVESTIGATE CAPTURE playbook when the user asks to investigate the buffer, hunt malicious traffic, or runs /investigate:
+1. live_stats then ekfiddle_threats or ekfiddle_sessions. Critical/High first
+2. Fetch at most a few highest-severity JS/HTML bodies. Skip Low External Script Monitor unless IOCs demand it
+3. Pivot with sessions_search on hosts or URLs found in those bodies. Keep the zero-hit budget tight
+4. Trace chain: landing to loader to C2 or RPC to payload or overlay
+5. Stop early when the picture is clear. Do not burn the tool budget on serial zero-hit hosts
+6. Final structured summary: Infection chain, hosts and IOCs, verdict. Then EKFiddle rules only if malicious high-signal evidence exists
+7. Do not author CustomRegexes for confirmed FP or benign libraries such as Google Maps, Mautic, or WordPress dns-prefetch unless the user explicitly asks for FP monitors
 
 EKFIDDLE RULE AUTHORING HARD MODE when user asks for EKFiddle rules, CustomRegexes, or signatures:
 
@@ -312,13 +353,14 @@ QUALITY BAR for regexes:
 - Keep 2 to 6 strong rules. Prefer fewer precise rules over many weak ones
 
 EXPLANATIONS: for each rule write a short paragraph that includes The crucial pattern or The key pattern. Then end with a plain block of ONLY the tab-separated rule lines for copy into CustomRegexes.txt. Then STOP. No more tool calls. No markdown tables. No Name/Regex/Comment/Color. No slash-wrapped /regex/i.
+Do not emit Low: rules for confirmed Benign or False Positive findings unless the user asked for FP monitor rules.
 
 INFECTION CHAIN REQUESTS: when the user asks for the infection flow, explain stages from evidence: landing or infected page, injected SourceCode behavior, RPC or C2 discovery, payload or redirect hosts, overlay or clickfix delivery. Use prior body findings if present. Do not burn the tool budget re-searching every IOC domain that already returned 0.
 
 WORKFLOW:
 - Prefer fiddler_mcp__ekfiddle_threats or fiddler_mcp__ekfiddle_sessions for triage
 - Use fiddler_mcp__sessions_search for host/url/content_type hunts
-- Use fiddler_mcp__session_body for deep analysis
+- Use fiddler_mcp__session_body for deep analysis of JS/HTML
 - Use fiddler_mcp__compare_sessions when user asks to compare 2 to 10 sessions
 - You may make up to {max_followups} tool calls per user query; stop early when you can answer
 - When finished, answer in clear analyst prose without emitting tool JSON text

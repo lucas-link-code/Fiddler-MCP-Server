@@ -2687,7 +2687,11 @@ class EnhancedFiddlerRealtimeBridge:
                 
                 with self.session_lock:
                     sessions = list(self.live_sessions)
-                
+
+                # Apply time window (was previously ignored despite time_range_minutes)
+                time_range = max(1, min(time_range, 180))
+                sessions = self._filter_sessions(sessions, since_minutes=time_range)
+
                 # Filter by host if specified
                 if filter_host:
                     sessions = [s for s in sessions if filter_host.lower() in s.get('host', '').lower()]
@@ -2887,37 +2891,46 @@ class EnhancedFiddlerRealtimeBridge:
             """Get sessions with EKFiddle analysis data"""
             try:
                 limit = int(request.args.get('limit', 50))
-                time_range = int(request.args.get('time_range', 60))
+                time_range = int(
+                    request.args.get('time_range_minutes')
+                    or request.args.get('time_range', 60)
+                )
+                time_range = max(1, min(time_range, 360))
                 threat_level = request.args.get('threat_level', 'all')
                 
                 sessions_with_ekfiddle = []
                 
                 with self.session_lock:
-                    for session in self.live_sessions:
-                        ekfiddle_data = session.get('ekfiddleComments', '')
-                        if ekfiddle_data and ekfiddle_data.strip():
-                            session_copy = session.copy()
-                            session_copy['ekfiddle_analysis'] = self.parse_ekfiddle_comments(ekfiddle_data)
-                            
-                            # Filter by threat level if specified
-                            if threat_level != 'all':
-                                analysis = session_copy['ekfiddle_analysis']
-                                session_severity = analysis.get('severity', 'unknown')
-                                if threat_level == 'high' and session_severity != 'high':
-                                    continue
-                                elif threat_level == 'medium' and session_severity not in ['high', 'medium']:
-                                    continue
-                                elif threat_level == 'low' and session_severity not in ['high', 'medium', 'low']:
-                                    continue
-                            
-                            sessions_with_ekfiddle.append(session_copy)
+                    base_sessions = list(self.live_sessions)
+
+                recent = self._filter_sessions(base_sessions, since_minutes=time_range)
+                for session in recent:
+                    ekfiddle_data = session.get('ekfiddleComments', '')
+                    if ekfiddle_data and ekfiddle_data.strip():
+                        session_copy = session.copy()
+                        session_copy['ekfiddle_analysis'] = self.parse_ekfiddle_comments(ekfiddle_data)
+                        
+                        # Filter by threat level if specified
+                        if threat_level != 'all':
+                            analysis = session_copy['ekfiddle_analysis']
+                            session_severity = analysis.get('severity', 'unknown')
+                            if threat_level == 'high' and session_severity != 'high':
+                                continue
+                            elif threat_level == 'medium' and session_severity not in ['high', 'medium']:
+                                continue
+                            elif threat_level == 'low' and session_severity not in ['high', 'medium', 'low']:
+                                continue
+                        
+                        sessions_with_ekfiddle.append(session_copy)
                 
                 # Return most recent ones first, limited by requested amount
                 sessions_with_ekfiddle = sessions_with_ekfiddle[-limit:]
                 
                 return jsonify({
+                    "success": True,
                     "results": sessions_with_ekfiddle,
-                    "total_sessions": len(self.live_sessions),
+                    "sessions": sessions_with_ekfiddle,
+                    "total_sessions": len(base_sessions),
                     "threats_found": len(sessions_with_ekfiddle),
                     "ekfiddle_summary": self.summarize_ekfiddle_findings(sessions_with_ekfiddle),
                     "time_range_minutes": time_range,
@@ -2967,42 +2980,56 @@ class EnhancedFiddlerRealtimeBridge:
         def get_ekfiddle_threats():
             """Get high-risk threats identified by EKFiddle"""
             try:
-                time_range = int(request.args.get('time_range', 120))
+                time_range = int(
+                    request.args.get('time_range_minutes')
+                    or request.args.get('time_range', 120)
+                )
+                time_range = max(1, min(time_range, 360))
                 min_risk_score = float(request.args.get('min_risk_score', 0.7))
-                categories = request.args.get('categories', 'malware,exploit,phishing').split(',')
+                categories_raw = request.args.get('categories', '')
+                categories = [c.strip().lower() for c in categories_raw.split(',') if c.strip()]
                 
                 high_risk_threats = []
                 critical_sessions = []
                 
                 with self.session_lock:
-                    for session in self.live_sessions:
-                        ekfiddle_data = session.get('ekfiddleComments', '')
-                        if ekfiddle_data and ekfiddle_data.strip():
-                            threat_assessment = self.assess_ekfiddle_threat(ekfiddle_data)
-                            risk_score = threat_assessment.get("risk_score", 0)
+                    base_sessions = list(self.live_sessions)
+
+                recent = self._filter_sessions(base_sessions, since_minutes=time_range)
+                for session in recent:
+                    ekfiddle_data = session.get('ekfiddleComments', '')
+                    if ekfiddle_data and ekfiddle_data.strip():
+                        threat_assessment = self.assess_ekfiddle_threat(ekfiddle_data)
+                        risk_score = threat_assessment.get("risk_score", 0)
+                        
+                        if risk_score >= min_risk_score:
+                            analysis = self.parse_ekfiddle_comments(ekfiddle_data)
+                            threat_types = [t.lower() for t in analysis.get('threat_types', [])]
                             
-                            if risk_score >= min_risk_score:
-                                analysis = self.parse_ekfiddle_comments(ekfiddle_data)
-                                threat_types = analysis.get('threat_types', [])
-                                
-                                # Check if matches requested categories
-                                if any(cat.strip() in threat_types for cat in categories):
-                                    threat_info = {
-                                        "session_id": session.get('id', session.get('bridge_id', 'unknown')),
-                                        "host": session.get('host', ''),
-                                        "url": session.get('url', ''),
-                                        "risk_score": risk_score,
-                                        "threat_level": threat_assessment.get("threat_level", "UNKNOWN"),
-                                        "threat_types": threat_types,
-                                        "indicators": analysis.get("indicators", []),
-                                        "recommendations": threat_assessment.get("recommendations", [])
-                                    }
-                                    high_risk_threats.append(threat_info)
-                                    
-                                    if risk_score >= 0.8:  # Critical threshold
-                                        critical_sessions.append(threat_info)
+                            # Optional category filter; empty categories = all score matches
+                            if categories:
+                                if threat_types and not any(cat in threat_types for cat in categories):
+                                    continue
+                                if not threat_types and not any(cat in ekfiddle_data.lower() for cat in categories):
+                                    continue
+                            threat_info = {
+                                "session_id": session.get('id', session.get('bridge_id', 'unknown')),
+                                "host": session.get('host', ''),
+                                "url": session.get('url', ''),
+                                "risk_score": risk_score,
+                                "threat_level": threat_assessment.get("threat_level", "UNKNOWN"),
+                                "threat_types": threat_types,
+                                "indicators": analysis.get("indicators", []),
+                                "recommendations": threat_assessment.get("recommendations", []),
+                                "ekfiddle_comment": ekfiddle_data,
+                            }
+                            high_risk_threats.append(threat_info)
+                            
+                            if risk_score >= 0.8:  # Critical threshold
+                                critical_sessions.append(threat_info)
                 
                 return jsonify({
+                    "success": True,
                     "threats": high_risk_threats,
                     "total_count": len(high_risk_threats),
                     "critical_sessions": critical_sessions,

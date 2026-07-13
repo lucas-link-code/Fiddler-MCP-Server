@@ -31,10 +31,10 @@ try:
     warnings.filterwarnings("ignore", message=r"Unrecognized FinishReason enum value", category=UserWarning)
     
     import google.generativeai as genai
+    GENAI_AVAILABLE = True
 except ImportError:
-    print("ERROR: Google Generative AI library not installed.")
-    print("Install with: pip install google-generativeai")
-    sys.exit(1)
+    genai = None  # type: ignore
+    GENAI_AVAILABLE = False
 
 try:
     from rich.console import Console
@@ -42,6 +42,191 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
+    Console = None  # type: ignore
+    Markdown = None  # type: ignore
+
+# Package name in requirements -> import module name
+_REQ_IMPORT_MAP = {
+    "google-generativeai": "google.generativeai",
+    "rich": "rich",
+    "mcp": "mcp",
+    "pydantic": "pydantic",
+    "flask": "flask",
+    "requests": "requests",
+}
+
+REQUIRED_SCRIPTS = (
+    "enhanced-bridge.py",
+    "5ire-bridge.py",
+    "gemini_native_tools.py",
+)
+
+
+def _python_executable() -> str:
+    if sys.executable:
+        return sys.executable
+    import platform
+    return "python" if platform.system() == "Windows" else "python3"
+
+
+def _parse_requirements_packages(req_path: Path) -> List[str]:
+    """Return pip requirement lines (non-empty, non-comment)."""
+    if not req_path.exists():
+        return []
+    lines = []
+    for raw in req_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _requirement_base_name(req_line: str) -> str:
+    """Strip version pins / extras: google-generativeai==0.8.5 -> google-generativeai."""
+    name = req_line.strip()
+    for sep in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+        if sep in name:
+            name = name.split(sep, 1)[0]
+            break
+    if "[" in name:
+        name = name.split("[", 1)[0]
+    return name.strip().lower()
+
+
+def _is_importable(module_name: str) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_python_dependencies(script_dir: Optional[Path] = None, auto_install: bool = True) -> bool:
+    """Check requirements-gemini.txt packages; pip install missing ones if allowed.
+
+    Returns True if all required imports are available after the check/install.
+    """
+    root = Path(script_dir) if script_dir else Path(__file__).resolve().parent
+    req_path = root / "requirements-gemini.txt"
+    print("\n[*] Checking Python dependencies...")
+
+    if not req_path.exists():
+        print(f"[!] {req_path.name} not found; checking core imports only")
+        req_lines = [
+            "google-generativeai==0.8.5",
+            "rich>=13.0.0",
+            "mcp>=1.0.0",
+            "pydantic>=2.0.0",
+            "Flask>=2.0.0",
+            "requests>=2.28.0",
+        ]
+    else:
+        req_lines = _parse_requirements_packages(req_path)
+        print(f"[+] Using {req_path.name}")
+
+    missing_reqs: List[str] = []
+    present: List[str] = []
+    for req in req_lines:
+        base = _requirement_base_name(req)
+        mod = _REQ_IMPORT_MAP.get(base, base.replace("-", "_"))
+        if _is_importable(mod):
+            present.append(base)
+        else:
+            missing_reqs.append(req)
+
+    if present:
+        print(f"[+] Installed: {', '.join(present)}")
+    if not missing_reqs:
+        print("[+] All required Python packages are available")
+        return True
+
+    print(f"[!] Missing packages: {', '.join(_requirement_base_name(r) for r in missing_reqs)}")
+    if not auto_install:
+        print("[!] Auto-install disabled. Run: pip install -r requirements-gemini.txt")
+        return False
+
+    py = _python_executable()
+    cmd = [py, "-m", "pip", "install", "--upgrade"]
+    if req_path.exists():
+        cmd.extend(["-r", str(req_path)])
+        print(f"[*] Installing from {req_path.name} ...")
+    else:
+        cmd.extend(missing_reqs)
+        print(f"[*] Installing: {' '.join(missing_reqs)}")
+
+    try:
+        result = subprocess.run(cmd, cwd=str(root), check=False)
+        if result.returncode != 0:
+            print(f"[X] pip install failed with exit code {result.returncode}")
+            return False
+    except Exception as exc:
+        print(f"[X] pip install failed: {exc}")
+        return False
+
+    # Re-check
+    still_missing = []
+    for req in req_lines:
+        base = _requirement_base_name(req)
+        mod = _REQ_IMPORT_MAP.get(base, base.replace("-", "_"))
+        if not _is_importable(mod):
+            still_missing.append(base)
+    if still_missing:
+        print(f"[X] Still missing after install: {', '.join(still_missing)}")
+        print("[!] Try manually: python -m pip install -r requirements-gemini.txt")
+        return False
+
+    print("[+] Dependencies installed successfully")
+    # Reload genai into this process if it was missing at import time
+    global genai, GENAI_AVAILABLE, RICH_AVAILABLE, Console, Markdown
+    try:
+        import google.generativeai as _genai
+        genai = _genai
+        GENAI_AVAILABLE = True
+    except ImportError:
+        GENAI_AVAILABLE = False
+        return False
+    if not RICH_AVAILABLE:
+        try:
+            from rich.console import Console as _Console
+            from rich.markdown import Markdown as _Markdown
+            Console = _Console
+            Markdown = _Markdown
+            RICH_AVAILABLE = True
+        except ImportError:
+            pass
+    return True
+
+
+def ensure_required_scripts(script_dir: Optional[Path] = None) -> bool:
+    """Verify companion scripts exist next to the client."""
+    root = Path(script_dir) if script_dir else Path(__file__).resolve().parent
+    print("\n[*] Checking required scripts...")
+    ok = True
+    for name in REQUIRED_SCRIPTS:
+        path = root / name
+        if path.exists():
+            print(f"[+] Found {name}")
+        else:
+            print(f"[X] Missing {name} (expected at {path})")
+            ok = False
+    return ok
+
+
+def bootstrap_runtime(auto_install: bool = True) -> bool:
+    """Install deps and verify scripts before starting bridges/client."""
+    root = Path(__file__).resolve().parent
+    skip_install = os.environ.get("GEMINI_SKIP_DEP_INSTALL", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not ensure_python_dependencies(root, auto_install=auto_install and not skip_install):
+        return False
+    if not GENAI_AVAILABLE:
+        print("[X] google.generativeai still unavailable after dependency check")
+        return False
+    if not ensure_required_scripts(root):
+        return False
+    return True
 
 # Available Gemini models for selection (centralized for consistency)
 # Model IDs from https://ai.google.dev/gemini-api/docs/models (Gemini 3 / 2.5)
@@ -94,6 +279,13 @@ class GeminiFiddlerClient:
         self.script_dir = Path(__file__).resolve().parent
         self.bridge_url = os.environ.get("FIDDLER_BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
         self._current_user_query = ""
+        self._mcp_server_command: Optional[List[str]] = None
+        # Native Gemini function calling (default on). Set GEMINI_NATIVE_TOOLS=0 for legacy text JSON loop.
+        self.use_native_tools = os.environ.get("GEMINI_NATIVE_TOOLS", "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        self._gemini_tool = None
+        self._system_instruction = ""
         
         if RICH_AVAILABLE:
             self.console = Console()
@@ -102,10 +294,17 @@ class GeminiFiddlerClient:
             self.console = None
             self.use_rich = False
         
+        if not GENAI_AVAILABLE or genai is None:
+            raise RuntimeError(
+                "google-generativeai is not installed. "
+                "Run: python -m pip install -r requirements-gemini.txt"
+            )
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(model_name)
         
         print(f"Initialized Gemini {model_name}")
+        if self.use_native_tools:
+            print("[*] Native tool schema binding enabled (GEMINI_NATIVE_TOOLS=1)")
         if not RICH_AVAILABLE:
             print("[!] Tip: Install 'rich' library for better formatting: pip install rich")
 
@@ -120,8 +319,12 @@ class GeminiFiddlerClient:
         "fiddler_mcp__session_body": {"session_id", "include_binary", "smart_extract"},
         "fiddler_mcp__compare_sessions": {"session_ids", "include_binary", "smart_extract"},
         "fiddler_mcp__live_stats": set(),
-        "fiddler_mcp__sessions_timeline": {"group_by", "since_minutes", "filter_host"},
-        "fiddler_mcp__sessions_clear": {"confirm"},
+        "fiddler_mcp__sessions_timeline": {
+            "time_range_minutes", "group_by", "include_details", "filter_host", "since_minutes",
+        },
+        "fiddler_mcp__sessions_clear": {"confirm", "clear_suspicious"},
+        "fiddler_mcp__ekfiddle_sessions": {"limit", "time_range_minutes", "threat_level"},
+        "fiddler_mcp__ekfiddle_threats": {"time_range_minutes", "min_risk_score", "categories"},
     }
 
     @staticmethod
@@ -246,6 +449,13 @@ class GeminiFiddlerClient:
                         pat = pat[:-1]
                     args[key] = pat.strip()
 
+        # Timeline: map legacy since_minutes -> time_range_minutes
+        if tool_name == "fiddler_mcp__sessions_timeline":
+            if "time_range_minutes" not in args and "since_minutes" in args:
+                args["time_range_minutes"] = args.pop("since_minutes")
+            elif "since_minutes" in args:
+                args.pop("since_minutes", None)
+
         allowed = self._TOOL_ARG_KEYS.get(tool_name)
         if allowed is not None:
             unknown = [k for k in list(args.keys()) if k not in allowed]
@@ -298,7 +508,10 @@ class GeminiFiddlerClient:
         regex = parts[2].strip()
         if rule_type not in ("IP", "URI", "SourceCode", "Headers", "Hash"):
             return False
-        if not any(severity_name.startswith(s) for s in ("High:", "Med:", "Low:")):
+        # Accept Med: or common LLM slip Medium: (normalized on save)
+        if not any(
+            severity_name.startswith(s) for s in ("High:", "Med:", "Medium:", "Low:")
+        ):
             return False
         if len(regex) < 3:
             return False
@@ -326,6 +539,11 @@ class GeminiFiddlerClient:
                 line = raw.rstrip("\n").strip()
                 if not line or line in seen:
                     continue
+                # Normalize common LLM severity slip Medium: → Med:
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[1].strip().startswith("Medium:"):
+                    parts[1] = "Med:" + parts[1].strip()[len("Medium:") :]
+                    line = "\t".join(parts)
                 if self._validate_ekfiddle_rule_line(line):
                     seen.add(line)
                     rules.append(line)
@@ -638,13 +856,48 @@ class GeminiFiddlerClient:
             if candidate.exists():
                 server_command[1] = str(candidate)
 
+        self._mcp_server_command = server_command
         self.start_mcp_server(server_command)
         return True
+
+    def is_mcp_alive(self) -> bool:
+        proc = getattr(self, "mcp_process", None)
+        return proc is not None and proc.poll() is None
+
+    def ensure_mcp_alive(self) -> bool:
+        """Restart MCP child if it died (common after Windows Ctrl+C process-group signal)."""
+        if self.is_mcp_alive():
+            return True
+        # Unit tests / partial clients may lack a process handle; do not crash call_tool
+        if not hasattr(self, "mcp_process") and not getattr(self, "_mcp_server_command", None):
+            return True
+        print("[!] MCP server process is not running. Restarting 5ire-bridge...")
+        cmd = self._mcp_server_command
+        if not cmd:
+            cmd = [self._python_executable(), str(self.script_dir / "5ire-bridge.py")]
+        try:
+            # Clear dead handle before restart
+            self.mcp_process = None
+            self.start_mcp_server(cmd)
+            if self.is_mcp_alive():
+                print("[+] MCP server restarted")
+                # Re-bind tools if native mode (list_tools refreshes schemas)
+                try:
+                    tools = self.list_tools()
+                    if tools:
+                        print(f"[+] Re-discovered {len(tools)} tools after MCP restart")
+                except Exception as exc:
+                    print(f"[!] Tool rediscovery after restart failed: {exc}")
+                return True
+        except Exception as exc:
+            print(f"[X] Failed to restart MCP server: {exc}")
+        return False
 
     def start_mcp_server(self, server_command: List[str]):
         """Start the MCP server (5ire-bridge.py) as subprocess"""
         print(f"\n[*] Starting MCP server: {' '.join(server_command)}")
         try:
+            self._mcp_server_command = list(server_command)
             log_dir = Path(__file__).parent
             err_path = log_dir / "mcp_server.err.log"
             
@@ -672,16 +925,23 @@ class GeminiFiddlerClient:
                 print(f"[!] Error writing log file header: {e}")
                 raise
 
-            self.mcp_process = subprocess.Popen(
-                server_command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',  # Explicit UTF-8 encoding for cross-platform consistency
-                errors='replace',  # Replace invalid bytes instead of crashing
-                bufsize=0
-            )
+            popen_kwargs: Dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 0,
+            }
+            # Isolate child from Ctrl+C so soft-interrupt does not kill MCP
+            if sys.platform == "win32":
+                # CREATE_NEW_PROCESS_GROUP prevents console Ctrl+C broadcast to child
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            self.mcp_process = subprocess.Popen(server_command, **popen_kwargs)
             
             import threading
             def log_server_stderr():
@@ -908,10 +1168,47 @@ class GeminiFiddlerClient:
         
         tools = response.get("result", {}).get("tools", [])
         self.available_tools = tools
+        if self.use_native_tools:
+            self.bind_gemini_tools()
         return tools
+
+    def bind_gemini_tools(self) -> bool:
+        """Convert MCP tools to Gemini FunctionDeclarations and rebuild the model."""
+        import gemini_native_tools as native
+
+        self._system_instruction = native.investigation_system_instruction(self.max_followups)
+        tool, errors = native.build_gemini_tool(self.available_tools)
+        if errors:
+            for err in errors:
+                self.log_with_timestamp(f"Tool bind skip: {err}", to_console=True, prefix="[!] ")
+        if not tool:
+            self.log_with_timestamp("No Gemini tools bound; falling back to text tool loop", to_console=True, prefix="[!] ")
+            self._gemini_tool = None
+            self.use_native_tools = False
+            self.model = genai.GenerativeModel(self.model_name)
+            return False
+
+        self._gemini_tool = tool
+        self.model = genai.GenerativeModel(
+            self.model_name,
+            tools=[tool],
+            system_instruction=self._system_instruction,
+        )
+        n = len(getattr(tool, "function_declarations", []) or [])
+        names = [d.name for d in (tool.function_declarations or [])]
+        print(f"[+] Bound {n} Gemini FunctionDeclarations: {', '.join(names)}")
+        self.log_with_timestamp(f"Bound Gemini tools: {names}", to_console=False)
+        return True
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Call a specific MCP tool with progress indicator"""
+
+        if not self.ensure_mcp_alive():
+            return {
+                "success": False,
+                "error": "MCP server process is not running and restart failed",
+                "hint": "Restart gemini-fiddler-client.py or start 5ire-bridge.py manually",
+            }
         
         # Handle non-prefixed tool names (LLM sometimes omits fiddler_mcp__ prefix)
         NON_PREFIXED_ALIASES = {
@@ -930,6 +1227,8 @@ class GeminiFiddlerClient:
             "get_stats": "fiddler_mcp__live_stats",
             "sessions_timeline": "fiddler_mcp__sessions_timeline",
             "sessions_clear": "fiddler_mcp__sessions_clear",
+            "ekfiddle_sessions": "fiddler_mcp__ekfiddle_sessions",
+            "ekfiddle_threats": "fiddler_mcp__ekfiddle_threats",
         }
         
         # Handle dot notation (fiddler_mcp.tool_name -> fiddler_mcp__tool_name)
@@ -1673,101 +1972,60 @@ TRUST HIERARCHY for THREAT ASSESSMENT:
 If EKFiddle Critical/High flagged something, focus on CONFIRMING the threat type. Low flags need IOC correlation.
 
 EKFIDDLE RULE AUTHORING (when user asks for EKFiddle rules / CustomRegexes / signatures):
-This is a HARD TASK MODE. Follow exactly:
+This is a HARD TASK MODE. Follow the EKFiddle CustomRegexes skill bar exactly:
 
 1. If the user names a session ID, call fiddler_mcp__session_body for that session ONCE only if it is not already analyzed this query.
 2. Extract ONLY high-signal malicious patterns actually present in the tool results:
-   - Unique function names / JSON-RPC eth_call / method:'eth_call' / jsonrpc:'2.0'
-   - Overlay UI hijack: z-index:2147483647 with position:fixed + iframe injection
-   - Distinctive hex decode loops (parseInt(...,16) + String.fromCharCode) when unique enough
-   - Distinctive cookies (_cf_verified, _wp_perf_ok) or sendBeacon telemetry strings
-   - Domains / URIs / IPs that appear in the body or captured traffic
+   - Compound JSON-RPC: method:'eth_call' with jsonrpc:'2.0' and eth_call params shape, not bare eth_call alone
+   - Overlay UI hijack: z-index:2147483647 with position:fixed and iframe or clipboard-write
+   - Distinctive hex decode loops when unique enough; prefer technique over one hex function name
+   - Distinctive cookies or sendBeacon telemetry strings that are campaign-specific
+   - Domains / URIs / IPs that appear in the body, captured traffic, or the user query
 3. Emit rules in EXACT tab-separated CustomRegexes schema (TABS not spaces):
    [Type]	[Severity]: [Rule Name]	[Regex]	[Optional Comment]
    Types: SourceCode | URI | IP | Headers | Hash
-   Severity must start with High: or Med: or Low: including the colon
-4. Write a short explanation per rule starting with The crucial pattern or The key pattern.
+   Severity MUST be High: or Med: or Low: including the colon. Never write Medium:
+   Rule names: title case with spaces, threat-specific. No snake_case. No vague Potential X names.
+4. Write a short explanation per rule that includes The crucial pattern or The key pattern.
 5. End the answer with a plain block of ONLY the tab-separated rule lines so they can be copied into CustomRegexes.txt.
 6. STOP after delivering rules. Do NOT chase Low External Script Monitor siblings. Do NOT invent hosts not present in tool results.
 7. Do NOT refuse defensive CustomRegex generation when the user asks. Provide the rules.
 8. Do NOT emit Name/Regex/Comment/Color tables, slash-wrapped /regex/i, or markdown tables as the rule format.
-9. Prefer SourceCode rules for unique malicious JS. Use URI/IP only for IOCs observed in data.
-10. Keep regexes bounded and specific to avoid false positives and high CPU cost. Prefer distinctive literals over broad .* patterns.
-11. Do NOT write rules for NitroPack / ___mnag / text/lazyload MutationObserver unless the user explicitly asks for the Low External Script Monitor pattern.
+9. Prefer SourceCode rules for unique malicious JS. Use URI/IP only for IOCs observed in data or supplied by the user.
+10. Keep regexes bounded and specific: use {{0,120}} / [^}}]{{1,200}}, escape \\. \\( \\), non-capturing (?:...), avoid unbounded .*. Prefer 2 to 6 strong rules.
+11. FORBIDDEN unless user explicitly asks: bare \\beth_call\\b, _\\w{{7,8}}\\(\\), NitroPack / ___mnag / text/lazyload MutationObserver, createElement alone, appendChild alone.
+12. If improving a prior rule for false positives, tighten with compound tokens. Do not replace it with an unrelated or broken regex.
 
 Example correct rule lines:
-SourceCode	High: ErrTraffic eth_call RPC	method\s*:\s*['\"]eth_call['\"]
-SourceCode	High: EtherHiding Fullscreen Overlay	z-index\s*:\s*2147483647.{0,120}position\s*:\s*fixed
-URI	High: ErrTraffic Delivery Host	cdn\.apigateway\.co
+SourceCode	High: ErrTraffic eth_call RPC	method\\s*:\\s*['\"]eth_call['\"].{{0,80}}jsonrpc\\s*:\\s*['\"]2\\.0['\"]
+SourceCode	High: EtherHiding Fullscreen Overlay	z-index\\s*:\\s*2147483647.{{0,120}}position\\s*:\\s*fixed
+URI	High: ErrTraffic Delivery Host	cdn\\.apigateway\\.co
+
+ZERO-HIT AND INFECTION CHAIN:
+- If the user lists many IOC hosts and the first search returns 0, do not serially hunt every host. Report missing hosts, then use landing-page session bodies and prior findings.
+- When asked for the infection chain, explain stages from evidence even if RPC hosts are not currently in the buffer.
+- Low External Script Monitor is not a clean bill of health when eth_call or etherhiding patterns are present.
 
 NO INVENTED IOCs:
 - Never invent domains, IPs, cookies, or function names that did not appear in tool results or the user query.
 - If a host search returns 0, say so. Do not fabricate related infrastructure.
 
-CRITICAL INSTRUCTIONS FOR TOOL CALLING:
-1. When the user asks about Fiddler traffic, you MUST use the MCP tools listed above
-2. Prefer JSON-ONLY tool calls. If brief analysis is needed, keep it under 8 lines and put the tool JSON LAST:
+CRITICAL INSTRUCTIONS FOR TOOL CALLING (legacy text path only):
+NOTE: Prefer native Gemini FunctionDeclarations when GEMINI_NATIVE_TOOLS=1.
+If you must emit a text tool call, use JSON-ONLY with the tool LAST:
 {{"tool": "tool_name", "arguments": {{"param": "value"}}}}
 
-3. EXAMPLES OF CORRECT TOOL CALLS:
-   - List sessions: {{"tool": "fiddler_mcp__live_sessions", "arguments": {{"limit": 50}}}}
-   - Get body: {{"tool": "fiddler_mcp__session_body", "arguments": {{"session_id": "142"}}}}
-   - Compare sessions: {{"tool": "fiddler_mcp__compare_sessions", "arguments": {{"session_ids": ["134", "148", "192", "194"]}}}}
-   - Search host: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"host_pattern": "cdn.apigateway.co"}}}}
-   - Search JS: {{"tool": "fiddler_mcp__sessions_search", "arguments": {{"content_type": "javascript"}}}}
+RULES:
+1. Use ONLY MCP tools from the list above. Do not invent names.
+2. MAKE ONE TOOL CALL AT A TIME
+3. session_id must be a plain string like "262", never an object
+4. sessions_search has NO "query" field — use host_pattern / url_pattern / content_type
+5. Do not use leading * in host_pattern (use "drpc.org" not "*drpc.org")
+6. Prefer fiddler_mcp__ekfiddle_threats / ekfiddle_sessions for triage before bodies
 
-4. MAKE ONE TOOL CALL AT A TIME (not an array of calls)
-5. After each tool result, decide if another call is needed
-6. DO NOT use Python code execution or print() statements
-7. DO NOT respond with {{"tool_code": ...}} - this is incorrect
-8. DO NOT respond with [{{"tool_code": ...}}, ...] - this is an array and incorrect
-9. After receiving tool results, you can either make another tool call OR provide analysis
-10. For session IDs, always use them exactly as provided (they may be numbers or strings)
-11. session_id must be a plain string like "262", never an object
-12. sessions_search has NO "query" field — use host_pattern / url_pattern / content_type
-13. Do not use leading * in host_pattern (use "drpc.org" not "*drpc.org")
-
-MULTI-SESSION COMPARISON - NEW CAPABILITY:
-When user explicitly asks to COMPARE multiple sessions, use the fiddler_mcp__compare_sessions tool:
-
-USE CASES FOR fiddler_mcp__compare_sessions:
-- "Compare sessions 134, 148, 192, 194"
-- "What are the differences between sessions X, Y, Z?"
-- "Analyze sessions A, B, C and tell me how they fit together"
-- "Compare the code from sessions 10, 20, 30"
-- "Check sessions X, Y, Z and show me the similarities"
-
-WHEN TO USE COMPARE vs SINGLE SESSION:
-- User says "compare", "differences", "how do they fit together" → Use fiddler_mcp__compare_sessions
-- User lists 2-10 specific session IDs to analyze together → Use fiddler_mcp__compare_sessions
-- User asks about ONE session only → Use fiddler_mcp__session_body
-- User asks "analyze top 5 EKFiddle" → Fetch ONE at a time with fiddler_mcp__session_body
-
-EXAMPLE COMPARISON WORKFLOW:
-User: "compare sessions 134, 148, 192, 194 check code from all fresh again and tell me the difference and summary of all - how does this all fit together"
-
-Step 1: Call comparison tool:
-{{"tool": "fiddler_mcp__compare_sessions", "arguments": {{"session_ids": ["134", "148", "192", "194"]}}}}
-
-Step 2: Analyze ALL sessions together:
-- Compare code structure and patterns
-- Identify common functions, variables, strings
-- Note KEY differences in behavior
-- Explain the RELATIONSHIP (e.g., multi-stage attack, related scripts, same malware family)
-- Provide HOLISTIC SUMMARY of how they all fit together
-
-Step 3: Apply SECURITY ANALYSIS FRAMEWORK:
-- Check malicious pattern checklist across ALL sessions
-- Identify if they're part of a coordinated attack
-- Note any progression or staging (loader → payload → C&C)
-- Correlate with EKFiddle comments if present
-
-COMPARISON ANALYSIS STRUCTURE:
-1. OVERVIEW: "Comparing code from sessions X, Y, Z..."
-2. COMMONALITIES: "All sessions share: [list patterns, functions, domains, etc.]"
-3. DIFFERENCES: "Key differences: Session X does A, Session Y does B..."
-4. RELATIONSHIPS: "How they fit together: Session X loads Session Y which executes Session Z..."
-5. SYNTHESIS: "Overall assessment: This appears to be [type of attack/behavior]"
+MULTI-SESSION COMPARISON:
+When user asks to COMPARE 2-10 sessions, use fiddler_mcp__compare_sessions.
+When asking about ONE session, use fiddler_mcp__session_body.
 
 MULTIPLE TOOL CALLS - YOU CAN CALL TOOLS REPEATEDLY:
 
@@ -2040,6 +2298,184 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         markdown_indicators = ['**', '__', '`', '# ', '## ', '### ', '* ', '- ', '+ ', '[', '|']
         return any(indicator in text for indicator in markdown_indicators)
 
+    def _chat_native(self, user_query: str) -> str:
+        """Native Gemini function-calling loop with MCP call_tool as execution gate."""
+        import gemini_native_tools as native
+        from google.generativeai import protos
+
+        query_start_time = time.time()
+        total_gemini_time = 0.0
+        total_bridge_time = 0.0
+        tool_call_count = 0
+        max_calls = self.max_followups
+
+        history_snip = self._format_recent_history()
+        user_text = (
+            f"Analyst question: {user_query}\n\n"
+            f"{self._analyzed_sessions_note()}\n\n"
+            f"Recent conversation:\n{history_snip}\n\n"
+            "Use tools as needed. Prefer ekfiddle_threats/ekfiddle_sessions for triage, "
+            "sessions_search for host hunts, session_body for deep analysis, "
+            "compare_sessions when asked to compare. "
+            "ZERO-HIT: after one missed host on a user IOC list, stop serial hunting; "
+            "report missing hosts and continue from bodies or prior findings. "
+            "EKFiddle rules: High:/Med:/Low: only, title-case names, compound high-signal "
+            "regexes with bounded quantifiers, The crucial/key pattern explanations, then "
+            "plain tab-separated rule lines and STOP. No bare eth_call, no _\\w{{7,8}}\\(\\), "
+            "no NitroPack/lazyload unless asked. Answer infection-chain questions from "
+            "prior evidence when bodies were already analyzed."
+        )
+        contents: List[Any] = [
+            protos.Content(role="user", parts=[protos.Part(text=user_text)])
+        ]
+
+        try:
+            if self.show_progress:
+                print(f"  (Native tools: up to {max_calls} calls. Ctrl+C stops this chain)")
+
+            while tool_call_count < max_calls:
+                self._check_interrupt()
+                sys.stdout.write("\r  Waiting for Gemini LLM (native tools)...")
+                sys.stdout.flush()
+                gemini_start = time.time()
+                response = self.model.generate_content(
+                    contents,
+                    tool_config=native.tool_config("AUTO"),
+                )
+                self._check_interrupt()
+                gemini_elapsed = time.time() - gemini_start
+                total_gemini_time += gemini_elapsed
+                sys.stdout.write(f"\r  [Gemini LLM] Response ({gemini_elapsed:.1f}s)                    \n")
+                sys.stdout.flush()
+
+                calls = native.extract_function_calls(response)
+                text = native.extract_text_parts(response)
+
+                # Fallback: legacy text JSON tool call if no native function_call parts
+                if not calls and text:
+                    legacy = self.parse_gemini_response(text)
+                    if legacy:
+                        calls = [{"name": legacy["tool"], "args": legacy.get("arguments") or {}}]
+
+                if not calls:
+                    final = text or "No response from model."
+                    self.conversation_history.append({"role": "assistant", "content": final})
+                    self.log_with_timestamp(
+                        f"Query Summary: native_tools, gemini={total_gemini_time:.1f}s, "
+                        f"bridge={total_bridge_time:.1f}s, tool_calls={tool_call_count}",
+                        to_console=False,
+                    )
+                    return self._finalize_assistant_response(final)
+
+                model_content = native.model_content_from_response(response)
+                if model_content is not None:
+                    contents.append(model_content)
+                else:
+                    # Reconstruct model turn from extracted calls
+                    parts = []
+                    for c in calls:
+                        parts.append(
+                            protos.Part(
+                                function_call=protos.FunctionCall(
+                                    name=c["name"],
+                                    args=c.get("args") or {},
+                                )
+                            )
+                        )
+                    if text:
+                        parts.insert(0, protos.Part(text=text))
+                    contents.append(protos.Content(role="model", parts=parts))
+
+                if text and text.strip():
+                    # Show interim analyst notes
+                    if self.use_rich and self.console:
+                        self.console.print("\n[bold cyan]< Gemini:[/bold cyan]")
+                        self.console.print(text)
+                    else:
+                        print(f"\n< Gemini: {text}")
+                    self.maybe_persist_ekfiddle_rules(text)
+
+                response_parts = []
+                for call in calls:
+                    self._check_interrupt()
+                    name = call["name"]
+                    args = call.get("args") or {}
+                    bridge_start = time.time()
+                    result = self.call_tool(name, args)
+                    bridge_elapsed = time.time() - bridge_start
+                    total_bridge_time += bridge_elapsed
+                    tool_call_count += 1
+                    self.log_with_timestamp(
+                        f"Tool Chain: call #{tool_call_count} -> {name} ({bridge_elapsed*1000:.0f}ms)",
+                        to_console=False,
+                    )
+                    self.conversation_history.append({
+                        "role": "tool",
+                        "tool": name,
+                        "content": json.dumps(result, indent=2, default=str)[:8000],
+                    })
+                    response_parts.append(native.build_function_response_part(name, result))
+
+                nudge = (
+                    f"{self._analyzed_sessions_note()}\n"
+                    "Continue investigation or give the final answer. "
+                    "If user asked for EKFiddle rules and you have malicious SourceCode evidence, "
+                    "emit tab-separated rules now and stop calling tools."
+                )
+                response_parts.append(protos.Part(text=nudge))
+                contents.append(protos.Content(role="user", parts=response_parts))
+
+            # Budget exhausted — force text-only synthesis
+            self.log_with_timestamp(
+                f"Native tools: budget exhausted after {tool_call_count} calls",
+                to_console=False,
+            )
+            synth_prompt = (
+                f"Tool call budget exhausted ({max_calls}). Do NOT call tools.\n"
+                f"User question: {user_query}\n"
+                f"{self._analyzed_sessions_note()}\n"
+                "Provide FINAL SYNTHESIS. If EKFiddle rules were requested, emit best "
+                "tab-separated CustomRegexes from evidence already gathered. Do not invent IOCs."
+            )
+            contents.append(protos.Content(role="user", parts=[protos.Part(text=synth_prompt)]))
+            sys.stdout.write("\r  Waiting for Gemini LLM final synthesis...")
+            sys.stdout.flush()
+            synth_start = time.time()
+            synth_resp = self.model.generate_content(
+                contents,
+                tool_config=native.tool_config("NONE"),
+            )
+            total_gemini_time += time.time() - synth_start
+            sys.stdout.write(f"\r  [Gemini LLM] Final synthesis complete                    \n")
+            sys.stdout.flush()
+            final = native.extract_text_parts(synth_resp) or "Tool budget reached."
+            self.conversation_history.append({"role": "assistant", "content": final})
+            self.log_with_timestamp(
+                f"Query Summary: native_tools budget, gemini={total_gemini_time:.1f}s, "
+                f"bridge={total_bridge_time:.1f}s, total={time.time()-query_start_time:.1f}s, "
+                f"tool_calls={tool_call_count}",
+                to_console=False,
+            )
+            return self._finalize_assistant_response(final)
+
+        except KeyboardInterrupt:
+            self.clear_interrupt()
+            # Ctrl+C can still kill an unprotected child on some hosts; recover immediately
+            if not self.is_mcp_alive():
+                print("[!] MCP child died during interrupt; attempting restart...")
+                self.ensure_mcp_alive()
+            interrupt_msg = (
+                "\n\n[INTERRUPTED] Stopped the current tool chain. "
+                "Conversation context is preserved. Ask a follow-up or type /quit to exit."
+            )
+            print(interrupt_msg)
+            self.conversation_history.append({"role": "system", "content": "[User interrupted the response]"})
+            return interrupt_msg
+        except Exception as e:
+            error_msg = f"Error processing query (native tools): {e}"
+            self.conversation_history.append({"role": "error", "content": error_msg})
+            return error_msg
+
     def chat(self, user_query: str) -> str:
         """Process user query with Gemini and execute tools as needed
         
@@ -2053,9 +2489,22 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         self._last_search_args = {}
         self.clear_interrupt()
         self._current_user_query = user_query
+
+        # Recover MCP if a prior Ctrl+C killed the child process group
+        if not self.ensure_mcp_alive():
+            err = (
+                "MCP server is not running and restart failed. "
+                "Restart gemini-fiddler-client.py or start 5ire-bridge.py manually."
+            )
+            self.conversation_history.append({"role": "user", "content": user_query})
+            self.conversation_history.append({"role": "error", "content": err})
+            return err
         
         # Add user query to history
         self.conversation_history.append({"role": "user", "content": user_query})
+
+        if self.use_native_tools and self._gemini_tool is not None:
+            return self._chat_native(user_query)
         
         # Build prompt
         self.log_with_timestamp("Building comprehensive prompt for Gemini...", to_console=False, prefix="Client: ")
@@ -2432,6 +2881,9 @@ Do not emit any tool JSON."""
         except KeyboardInterrupt:
             # Soft interrupt: stop this tool chain only; keep client + conversation
             self.clear_interrupt()
+            if not self.is_mcp_alive():
+                print("[!] MCP child died during interrupt; attempting restart...")
+                self.ensure_mcp_alive()
             interrupt_msg = (
                 "\n\n[INTERRUPTED] Stopped the current tool chain. "
                 "Conversation context is preserved. Ask a follow-up or type /quit to exit."
@@ -2639,10 +3091,15 @@ Do not emit any tool JSON."""
         
         old_model = self.model_name
         try:
-            self.model = genai.GenerativeModel(new_model)
             self.model_name = new_model
+            if self.use_native_tools and self.available_tools:
+                if not self.bind_gemini_tools():
+                    self.model = genai.GenerativeModel(new_model)
+            else:
+                self.model = genai.GenerativeModel(new_model)
             print(f"[+] Switched from {old_model} to {new_model}")
         except Exception as e:
+            self.model_name = old_model
             print(f"[X] Failed to switch model: {e}")
 
     def close(self):
@@ -2768,6 +3225,15 @@ def main():
     """Main entry point"""
     import platform
     import signal
+
+    print("\nGemini-Powered Fiddler Traffic Analyzer")
+    print("=" * 70)
+
+    # 1) Check / install Python deps and verify companion scripts
+    if not bootstrap_runtime(auto_install=True):
+        print("\n[X] Startup dependency check failed.")
+        print("[!] Fix missing packages/scripts, then re-run gemini-fiddler-client.py")
+        sys.exit(1)
     
     client = None
     _state = {"interactive": False, "in_chat": False}
@@ -2793,9 +3259,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     try:
-        print("\nGemini-Powered Fiddler Traffic Analyzer")
-        print("=" * 70)
-        
         # Load or create configuration
         config = load_config()
         if not config.get("api_key"):
@@ -2815,10 +3278,10 @@ def main():
         if config.get("bridge_url"):
             client.bridge_url = str(config["bridge_url"]).rstrip("/")
 
-        # Ensure enhanced-bridge (HTTP) + 5ire-bridge (MCP) are available
+        # 2) Ensure enhanced-bridge (HTTP) + 5ire-bridge (MCP) are running
         python_cmd = "python" if platform.system() == "Windows" else "python3"
         server_command = config.get("mcp_server_command", [python_cmd, "5ire-bridge.py"])
-        print("\n[*] Checking bridge dependencies...")
+        print("\n[*] Checking / starting bridges...")
         if not client.ensure_dependencies_running(server_command):
             print("[X] Required bridges are not available. Cannot continue.")
             print("[!] Start enhanced-bridge.py manually, then re-run this client.")

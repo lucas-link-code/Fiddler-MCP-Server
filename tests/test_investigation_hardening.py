@@ -265,6 +265,16 @@ class TestEkfiddleRuleHelpers(unittest.TestCase):
         self.assertEqual(len(rules), 2)
         self.assertTrue(rules[0].startswith("SourceCode\tHigh:"))
 
+    def test_extractor_normalizes_medium_to_med(self):
+        text = (
+            "SourceCode\tMedium: Dynamic iframe loading\t"
+            "document\\.createElement\\(['\\\"]iframe['\\\"]\\)"
+        )
+        rules = self.client._extract_ekfiddle_rules_from_text(text)
+        self.assertEqual(len(rules), 1)
+        self.assertTrue(rules[0].startswith("SourceCode\tMed:"))
+        self.assertNotIn("Medium:", rules[0])
+
     def test_save_helper_appends_under_temp_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "generated_ekfiddle_rules.txt"

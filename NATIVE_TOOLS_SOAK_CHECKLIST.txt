@@ -25,6 +25,7 @@ Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini
    In the same query, model should not re-pull the same session_body
    Client returns already analyzed this query if it tries
    Explicit re-fetch ask should unlock bodies
+   Auto-fetch must not re-pull already-analyzed session IDs
 
 5. Zero-hit
    Paste a list of IOC hosts where most are absent from the buffer
@@ -32,8 +33,9 @@ Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini
    Expect: continue from landing session bodies or prior findings, not serial burn of all IOCs
 
 6. Compare
-   Ask: compare sessions A and B
-   Expect: fiddler_mcp__compare_sessions; FunctionResponse truncated if bodies are large
+   Ask: compare sessions A and B (or 3+ IDs)
+   Expect: fiddler_mcp__compare_sessions succeeds
+   Expect: no RepeatedComposite JSON serialization error in mcp_server.err.log
 
 7. Budget / interrupt / MCP survival
    Ctrl+C mid-chain keeps the client alive and prints INTERRUPTED
@@ -45,7 +47,18 @@ Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini
    After bodies were already analyzed, ask for the infection chain
    Expect: staged explanation from prior findings without requiring live MCP if tools fail
 
-9. Legacy fallback
-   Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop
+9. Slash commands between cases
+   /clear clears live + suspicious bridge buffers and prints counts
+   /clearchat clears conversation history only
+   /investigate runs the malicious-traffic playbook
+   /investigate example.com prioritizes that host
+   Expect brief "  -> session_body N" / "  -> search host" lines during the chain
+
+10. Benign / FP
+    On a clean capture, expect Benign verdict without Low FP CustomRegexes auto-saved
+    Media session_body requests should be skipped with a media hint
+
+11. Legacy fallback
+    Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop
 
 Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.

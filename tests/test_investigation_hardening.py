@@ -338,6 +338,27 @@ class TestAutoFetchPolicy(unittest.TestCase):
         self.assertIsNotNone(picked)
         self.assertEqual(str(picked["id"]), "262")
 
+    def test_pick_skips_already_analyzed(self):
+        self.client._analyzed_session_ids = {"262"}
+        sessions = [
+            {
+                "id": "262",
+                "content_type": "text/html",
+                "url": "https://example.com/",
+                "size": 50000,
+                "ekfiddle_comment": "High: SocGholish Loader",
+            },
+            {
+                "id": "250",
+                "content_type": "application/javascript",
+                "url": "https://evil.example/loader.js",
+                "size": 12000,
+            },
+        ]
+        picked = self.client._pick_auto_fetch_session(sessions)
+        self.assertIsNotNone(picked)
+        self.assertEqual(str(picked["id"]), "250")
+
     def test_is_text_or_js_rejects_mp4(self):
         self.assertFalse(
             self.client._is_text_or_js_session(
@@ -348,6 +369,97 @@ class TestAutoFetchPolicy(unittest.TestCase):
                 }
             )
         )
+
+
+class TestCompareSanitizeAndStatus(unittest.TestCase):
+    def setUp(self):
+        self.client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
+        self.client._analyzed_session_ids = set()
+        self.client._last_search_args = {}
+        self.client.conversation_history = []
+        self.client._current_user_query = ""
+        self.client.log_with_timestamp = MagicMock()
+
+    def test_compare_coerces_repeated_like_session_ids(self):
+        class FakeRepeated:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def __iter__(self):
+                return iter(self._items)
+
+        FakeRepeated.__name__ = "RepeatedComposite"
+        out = self.client._sanitize_tool_arguments(
+            "fiddler_mcp__compare_sessions",
+            {"session_ids": FakeRepeated(["250", "231", "41"]), "smart_extract": True},
+        )
+        self.assertEqual(out["session_ids"], ["250", "231", "41"])
+        import json
+
+        json.dumps(out)
+
+    def test_brief_tool_status_formats(self):
+        self.assertEqual(
+            self.client._brief_tool_status(
+                "fiddler_mcp__session_body", {"session_id": "250"}
+            ),
+            "  -> session_body 250",
+        )
+        self.assertIn(
+            "auth-code-check.info",
+            self.client._brief_tool_status(
+                "fiddler_mcp__sessions_search",
+                {"host_pattern": "auth-code-check.info"},
+            ),
+        )
+        self.assertIn(
+            "compare",
+            self.client._brief_tool_status(
+                "fiddler_mcp__compare_sessions",
+                {"session_ids": ["1", "2", "3"]},
+            ),
+        )
+
+    def test_is_media_content_type(self):
+        self.assertTrue(self.client._is_media_content_type("image/png"))
+        self.assertTrue(self.client._is_media_content_type("video/mp4"))
+        self.assertFalse(self.client._is_media_content_type("text/html"))
+        self.assertFalse(self.client._is_media_content_type("application/javascript"))
+
+    def test_build_investigate_prompt_with_host(self):
+        prompt = self.client.build_investigate_prompt("https://www.mgc.es/")
+        self.assertIn("INVESTIGATE CAPTURE", prompt)
+        self.assertIn("mgc.es", prompt)
+
+    def test_clear_bridge_buffer_calls_mcp(self):
+        self.client.call_tool = MagicMock(
+            return_value={
+                "success": True,
+                "cleared_counts": {"live_sessions": 10, "suspicious_sessions": 2},
+            }
+        )
+        self.client._analyzed_session_ids = {"1", "2"}
+        result = self.client.clear_bridge_buffer()
+        self.client.call_tool.assert_called_once_with(
+            "fiddler_mcp__sessions_clear",
+            {"confirm": True, "clear_suspicious": True},
+        )
+        self.assertTrue(result.get("success"))
+        self.assertEqual(self.client._analyzed_session_ids, set())
+
+    def test_persist_skips_low_rules_on_benign_verdict(self):
+        self.client._current_user_query = "anything malicious in this traffic?"
+        self.client.script_dir = Path(tempfile.mkdtemp())
+        text = (
+            "The traffic is Benign. False Positive from dns-prefetch.\n"
+            "SourceCode\tLow: Mautic Marketing\tMauticTrackingObject\n"
+            "SourceCode\tHigh: SocGholish atob Loader\tatob\\(['\\\"]QgwfBAke\n"
+        )
+        # High should not appear together with Benign in real answers, but filter only drops Low:
+        saved = self.client.maybe_persist_ekfiddle_rules(text)
+        # Benign + not asked for rules => Low dropped; High still saved if present
+        self.assertTrue(all(not r.split("\t")[1].startswith("Low:") for r in saved))
+        self.assertTrue(any("SocGholish" in r for r in saved))
 
 
 if __name__ == "__main__":

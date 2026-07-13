@@ -382,6 +382,12 @@ class GeminiFiddlerClient:
             raw_ids = args["session_ids"]
             if isinstance(raw_ids, (str, int)):
                 raw_ids = [raw_ids]
+            elif not isinstance(raw_ids, list):
+                # Gemini may pass protobuf RepeatedComposite; coerce to a plain list
+                try:
+                    raw_ids = list(raw_ids)
+                except TypeError:
+                    raw_ids = [raw_ids]
             if isinstance(raw_ids, list):
                 flattened = []
                 for item in raw_ids:
@@ -571,6 +577,27 @@ class GeminiFiddlerClient:
         rules = self._extract_ekfiddle_rules_from_text(assistant_text)
         if not rules:
             return []
+        # Skip auto-save of Low: FP monitors when verdict is Benign unless user asked for rules
+        q = (getattr(self, "_current_user_query", None) or "").lower()
+        asked_for_rules = any(
+            token in q for token in ("ekfiddle", "customregex", "signature", " rule", "rules")
+        )
+        text_l = (assistant_text or "").lower()
+        benign_verdict = any(
+            token in text_l
+            for token in ("benign", "false positive", "false positives", "is a false positive")
+        )
+        if benign_verdict and not asked_for_rules:
+            filtered = []
+            for rule in rules:
+                parts = rule.split("\t")
+                sev = parts[1].strip() if len(parts) > 1 else ""
+                if sev.startswith("Low:"):
+                    continue
+                filtered.append(rule)
+            rules = filtered
+            if not rules:
+                return []
         path = self._save_ekfiddle_rules(rules)
         if path:
             print(f"[+] Saved {len(rules)} EKFiddle rules to {path.name}")
@@ -643,7 +670,7 @@ class GeminiFiddlerClient:
         return "javascript" in url or url.endswith(".js") or "/html" in ctype
 
     def _pick_auto_fetch_session(self, sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Prefer Critical/High EKFiddle JS/HTML, else first text/JS hit; skip media."""
+        """Prefer Critical/High EKFiddle JS/HTML, else first text/JS hit; skip media and already-analyzed."""
         def severity_rank(s: Dict[str, Any]) -> int:
             comment = (s.get("ekfiddle_comment") or "") + " " + " ".join(s.get("risk_reasons") or [])
             c = comment.lower()
@@ -657,11 +684,96 @@ class GeminiFiddlerClient:
                 return 1
             return 5
 
-        candidates = [s for s in sessions if self._is_text_or_js_session(s)]
+        analyzed = getattr(self, "_analyzed_session_ids", set()) or set()
+        candidates = []
+        for s in sessions:
+            if not self._is_text_or_js_session(s):
+                continue
+            sid = str(s.get("id") or s.get("session_id") or "").strip()
+            if sid and sid in analyzed:
+                continue
+            candidates.append(s)
         if not candidates:
             return None
         candidates.sort(key=severity_rank)
         return candidates[0]
+
+    @staticmethod
+    def _is_media_content_type(content_type: str) -> bool:
+        ctype = (content_type or "").lower()
+        return any(
+            x in ctype
+            for x in (
+                "image/",
+                "video/",
+                "audio/",
+                "font/",
+                "application/octet-stream",
+                "application/pdf",
+            )
+        )
+
+    @staticmethod
+    def _brief_tool_status(tool_name: str, args: Optional[Dict[str, Any]] = None) -> str:
+        """One-line investigation breadcrumb for the native tool loop."""
+        args = args or {}
+        short = (tool_name or "").replace("fiddler_mcp__", "")
+        if short == "session_body":
+            return f"  -> session_body {args.get('session_id', '?')}"
+        if short == "session_headers":
+            return f"  -> headers {args.get('session_id', '?')}"
+        if short == "sessions_search":
+            host = args.get("host_pattern") or args.get("url_pattern") or ""
+            return f"  -> search {host}".rstrip() if host else "  -> search"
+        if short == "compare_sessions":
+            ids = args.get("session_ids") or []
+            if isinstance(ids, list) and ids:
+                shown = ",".join(str(x) for x in ids[:4])
+                extra = f"+{len(ids) - 4}" if len(ids) > 4 else ""
+                return f"  -> compare {shown}{extra}"
+            return "  -> compare"
+        if short == "ekfiddle_threats":
+            return "  -> ekfiddle threats"
+        if short == "ekfiddle_sessions":
+            return "  -> ekfiddle sessions"
+        if short == "live_sessions":
+            return "  -> live sessions"
+        if short == "live_stats":
+            return "  -> stats"
+        if short == "sessions_timeline":
+            return "  -> timeline"
+        if short == "sessions_clear":
+            return "  -> clear buffer"
+        return f"  -> {short}"
+
+    @staticmethod
+    def build_investigate_prompt(host: Optional[str] = None) -> str:
+        """Canned malicious-traffic investigation prompt for /investigate."""
+        scope = ""
+        if host:
+            host = host.strip().rstrip("/")
+            if "://" in host:
+                # keep hostname only when a full URL was pasted
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(host if "://" in host else f"https://{host}")
+                    host = parsed.hostname or host
+                except Exception:
+                    pass
+            scope = (
+                f" Prioritize host {host}: search that host first, then follow "
+                "any loader/C2/RPC pivots found in its bodies."
+            )
+        return (
+            "Investigate the current capture buffer for any signs of malicious traffic. "
+            "Follow the INVESTIGATE CAPTURE playbook: triage with live_stats and "
+            "ekfiddle_threats/ekfiddle_sessions, fetch a few highest-severity JS/HTML bodies, "
+            "pivot on hosts found in those bodies, trace the infection chain, then give a "
+            "structured summary with Infection chain, hosts/IOCs, and verdict. "
+            "Emit EKFiddle CustomRegexes only if malicious high-signal evidence exists. "
+            "Do not author rules for confirmed FP or benign libraries."
+            f"{scope}"
+        )
 
     def log_with_timestamp(self, message: str, to_console: bool = True, prefix: str = "") -> None:
         """Log a message with timestamp to both console and log file"""
@@ -1343,6 +1455,31 @@ class GeminiFiddlerClient:
         elapsed_s = elapsed_ms / 1000
         
         result = self._parse_tool_response(response)
+
+        # Short-circuit media bodies: no malware signal, waste tokens
+        if (
+            tool_name == "fiddler_mcp__session_body"
+            and isinstance(result, dict)
+            and not result.get("error")
+        ):
+            ctype = result.get("content_type") or result.get("contentType") or ""
+            if self._is_media_content_type(ctype):
+                sid = arguments.get("session_id") or result.get("session_id") or result.get("id")
+                msg = (
+                    f"Session {sid} is media content ({ctype}). "
+                    "Skip media bodies; analyze JS/HTML/JSON sessions instead."
+                )
+                self.log_with_timestamp(msg, to_console=True, prefix="[!] ")
+                sys.stdout.write(f"\r  [Fiddler Bridge] Skipped media body ({elapsed_s:.1f}s)                    \n")
+                sys.stdout.flush()
+                return {
+                    "success": False,
+                    "error": msg,
+                    "session_id": sid,
+                    "content_type": ctype,
+                    "media_skipped": True,
+                    "hint": "Pick a text/html or application/javascript session for malware analysis.",
+                }
         
         # Enhanced result logging with session metadata
         try:
@@ -2005,6 +2142,15 @@ ZERO-HIT AND INFECTION CHAIN:
 - If the user lists many IOC hosts and the first search returns 0, do not serially hunt every host. Report missing hosts, then use landing-page session bodies and prior findings.
 - When asked for the infection chain, explain stages from evidence even if RPC hosts are not currently in the buffer.
 - Low External Script Monitor is not a clean bill of health when eth_call or etherhiding patterns are present.
+- Prefer session_body over session_headers. Treat headers 404 as non-fatal.
+- Do not emit Low: CustomRegexes for confirmed Benign or False Positive libraries unless the user asks for FP monitors.
+
+INVESTIGATE CAPTURE (when user asks to investigate the buffer / malicious traffic / /investigate):
+1. live_stats then ekfiddle_threats or ekfiddle_sessions; Critical/High first
+2. Fetch a few highest-severity JS/HTML bodies; skip Low External Script Monitor unless IOCs demand it
+3. Pivot sessions_search on hosts found in those bodies; keep zero-hit budget tight
+4. Trace landing to loader to C2/RPC to payload/overlay
+5. Structured summary: Infection chain, hosts/IOCs, verdict; EKFiddle rules only for malicious high-signal evidence
 
 NO INVENTED IOCs:
 - Never invent domains, IPs, cookies, or function names that did not appear in tool results or the user query.
@@ -2400,6 +2546,8 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
                     self._check_interrupt()
                     name = call["name"]
                     args = call.get("args") or {}
+                    if self.show_progress:
+                        print(self._brief_tool_status(name, args))
                     bridge_start = time.time()
                     result = self.call_tool(name, args)
                     bridge_elapsed = time.time() - bridge_start
@@ -2898,6 +3046,19 @@ Do not emit any tool JSON."""
             self.conversation_history.append({"role": "error", "content": error_msg})
             return error_msg
 
+    def clear_bridge_buffer(self) -> Dict[str, Any]:
+        """Clear enhanced-bridge live + suspicious buffers via MCP (no Gemini)."""
+        result = self.call_tool(
+            "fiddler_mcp__sessions_clear",
+            {"confirm": True, "clear_suspicious": True},
+        )
+        self._analyzed_session_ids = set()
+        return result if isinstance(result, dict) else {"success": False, "error": str(result)}
+
+    def clear_chat_history(self) -> None:
+        """Clear only the local conversation history."""
+        self.conversation_history.clear()
+
     def interactive_mode(self):
         """Run interactive chat session"""
         print("\n" + "=" * 70)
@@ -2910,14 +3071,7 @@ Do not emit any tool JSON."""
         print("  - Show me the body of session 240")
         print("  - Are there any suspicious sessions?")
         print("  - Search for JavaScript files from example.com")
-        print("\nCommands:")
-        print("  /help    - Show example queries")
-        print("  /stats   - Show bridge statistics")
-        print("  /tools   - List available tools")
-        print("  /model   - Show/change Gemini model")
-        print("  /history - Show conversation history")
-        print("  /clear   - Clear conversation history")
-        print("  /quit    - Exit")
+        self.show_commands_menu()
         print("\nTip: During a tool chain, Ctrl+C stops that answer only and returns to the prompt.")
         print("=" * 70)
         
@@ -2942,8 +3096,41 @@ Do not emit any tool JSON."""
                     elif user_input == "/history":
                         self.show_history()
                     elif user_input == "/clear":
-                        self.conversation_history.clear()
+                        print("\n[*] Clearing bridge capture buffers...")
+                        result = self.clear_bridge_buffer()
+                        if result.get("success") is False or result.get("error"):
+                            print(f"[X] Clear failed: {result.get('error') or result}")
+                        else:
+                            counts = result.get("cleared_counts") or {}
+                            live_n = counts.get("live_sessions", result.get("sessions_cleared", "?"))
+                            sus_n = counts.get(
+                                "suspicious_sessions",
+                                result.get("suspicious_cleared", "?"),
+                            )
+                            print(
+                                f"[+] Bridge buffers cleared "
+                                f"(live={live_n}, suspicious={sus_n})"
+                            )
+                    elif user_input == "/clearchat":
+                        self.clear_chat_history()
                         print("[+] Conversation history cleared")
+                    elif user_input == "/investigate" or user_input.startswith("/investigate "):
+                        host_arg = ""
+                        if user_input.startswith("/investigate "):
+                            host_arg = user_input[len("/investigate ") :].strip()
+                        prompt = self.build_investigate_prompt(host_arg or None)
+                        print(f"\n[*] Running investigate playbook{' for ' + host_arg if host_arg else ''}...")
+                        response = self.chat(prompt)
+                        if self.use_rich and self.console:
+                            self.console.print("\n[bold cyan]< Gemini:[/bold cyan]")
+                            if self._looks_like_markdown(response):
+                                md = Markdown(response)
+                                self.console.print(md)
+                            else:
+                                self.console.print(response)
+                        else:
+                            print("\n< Gemini: ", end="", flush=True)
+                            print(response)
                     elif user_input == "/model":
                         self.show_models()
                     elif user_input.startswith("/model "):
@@ -2977,11 +3164,27 @@ Do not emit any tool JSON."""
             except Exception as e:
                 print(f"\n[X] Error: {e}")
 
+    def show_commands_menu(self):
+        """Print the slash-command menu (same list as startup)."""
+        print("\nCommands:")
+        print("  /help         - Show this menu and example queries")
+        print("  /stats        - Show bridge statistics")
+        print("  /tools        - List available tools")
+        print("  /model        - Show/change Gemini model")
+        print("  /history      - Show conversation history")
+        print("  /clear        - Clear bridge capture buffers (live + suspicious)")
+        print("  /clearchat    - Clear conversation history")
+        print("  /investigate  - Hunt malicious traffic in the current buffer")
+        print("  /investigate <host> - Same playbook, prioritize a host")
+        print("  /quit         - Exit")
+
     def show_help(self):
-        """Show example queries"""
+        """Show slash-command menu and example queries."""
         print("\n" + "=" * 70)
-        print("Example Queries for Fiddler Traffic Analysis")
+        print("Fiddler Traffic Analyzer - Commands and Examples")
         print("=" * 70)
+        self.show_commands_menu()
+        print("\nTip: During a tool chain, Ctrl+C stops that answer only and returns to the prompt.")
         print("\n[*] OVERVIEW QUERIES:")
         print("  - Show me statistics about the captured traffic")
         print("  - How many sessions are in the buffer?")
@@ -3000,10 +3203,13 @@ Do not emit any tool JSON."""
         print("  - Find all JavaScript files from cdn.example.com")
         print("  - Show me sessions larger than 1MB")
         print("  - Get all failed requests (status >= 400)")
-        print("\n[*] TIMELINE & PATTERNS:")
-        print("  - Show me a timeline of traffic by host")
-        print("  - Group sessions by status code")
-        print("  - What's the traffic pattern for the last hour?")
+        print("\n[*] INVESTIGATE:")
+        print("  - /investigate")
+        print("  - /investigate example.com")
+        print("  - Investigate the capture buffer for malicious traffic")
+        print("\n[*] BUFFER:")
+        print("  - /clear        Clear bridge live + suspicious buffers between cases")
+        print("  - /clearchat    Clear conversation history only")
         print("=" * 70)
 
     def show_stats(self):

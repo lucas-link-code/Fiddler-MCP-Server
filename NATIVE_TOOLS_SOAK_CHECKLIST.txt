@@ -1,0 +1,51 @@
+Native Gemini Tool Binding - Manual Soak Checklist
+==================================================
+
+Run after deploy with enhanced-bridge + 5ire-bridge + gemini-fiddler-client.
+Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini FunctionDeclarations.
+
+1. Triage
+   Ask: show high ekfiddle threats from the last hour
+   Expect: fiddler_mcp__ekfiddle_threats or ekfiddle_sessions, not invented hosts
+
+2. Host hunt
+   Ask: search sessions for host X from capture
+   Expect: fiddler_mcp__sessions_search with host_pattern, optional auto body fetch
+
+3. Body once
+   Ask: create ekfiddle rules for malicious code in session N
+   Expect: one session_body fetch max, tab-separated SourceCode/URI rules, STOP
+   Expect: High:/Med:/Low: only (not Medium:), title-case rule names
+   Expect: compound high-signal regexes, not bare eth_call or _\\w{7,8}\\(\\)
+   Expect: The crucial pattern or The key pattern explanations
+   Expect: no NitroPack / ___mnag rules unless asked
+   Expect: generated_ekfiddle_rules.txt updated
+
+4. Refetch lock
+   In the same query, model should not re-pull the same session_body
+   Client returns already analyzed this query if it tries
+   Explicit re-fetch ask should unlock bodies
+
+5. Zero-hit
+   Paste a list of IOC hosts where most are absent from the buffer
+   Expect: at most 1 to 2 host searches after first zero-hit, then report missing hosts
+   Expect: continue from landing session bodies or prior findings, not serial burn of all IOCs
+
+6. Compare
+   Ask: compare sessions A and B
+   Expect: fiddler_mcp__compare_sessions; FunctionResponse truncated if bodies are large
+
+7. Budget / interrupt / MCP survival
+   Ctrl+C mid-chain keeps the client alive and prints INTERRUPTED
+   Expect: MCP child survives when possible (new process group / new session)
+   Expect: if MCP did die, next query or call_tool prints restart and recovers
+   Hitting GEMINI_MAX_TOOL_CALLS forces text synthesis with tools disabled
+
+8. Infection chain from prior evidence
+   After bodies were already analyzed, ask for the infection chain
+   Expect: staged explanation from prior findings without requiring live MCP if tools fail
+
+9. Legacy fallback
+   Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop
+
+Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.

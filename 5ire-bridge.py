@@ -727,6 +727,93 @@ class FiddlerBridgeClient:
             "timestamp": data.get("timestamp", datetime.now().isoformat()),
         }
 
+    def get_ekfiddle_sessions(
+        self,
+        *,
+        limit: int = 50,
+        time_range_minutes: int = 60,
+        threat_level: str = "all",
+    ) -> Dict[str, Any]:
+        """List sessions that carry EKFiddle comments within a time window."""
+        params = {
+            "limit": max(1, min(int(limit), 500)),
+            "time_range_minutes": max(1, min(int(time_range_minutes), 360)),
+            "threat_level": (threat_level or "all").lower(),
+        }
+        try:
+            data = self.request("GET", "/api/sessions/ekfiddle", params=params)
+        except BridgeConnectionError:
+            return {
+                "success": False,
+                "error": "Cannot connect to real-time bridge",
+                "bridge_status": "Disconnected",
+            }
+        except BridgeRequestError as exc:
+            return {"success": False, "error": f"EKFiddle sessions request failed: {exc}"}
+
+        sessions = data.get("sessions") or data.get("results") or []
+        normalized = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            comment = self._extract_ekfiddle_comment(session) or session.get("ekfiddleComments") or ""
+            normalized.append({
+                "id": str(session.get("id", session.get("bridge_id", ""))),
+                "host": session.get("host", ""),
+                "url": session.get("url", ""),
+                "method": session.get("method", ""),
+                "status": session.get("statusCode") or session.get("status"),
+                "content_type": session.get("contentType") or session.get("content_type"),
+                "ekfiddle_comment": comment,
+                "ekfiddle_analysis": session.get("ekfiddle_analysis"),
+            })
+
+        return {
+            "success": True,
+            "sessions": normalized,
+            "count": len(normalized),
+            "threats_found": data.get("threats_found", len(normalized)),
+            "ekfiddle_summary": data.get("ekfiddle_summary"),
+            "time_range_minutes": data.get("time_range_minutes", params["time_range_minutes"]),
+            "threat_level_filter": data.get("threat_level_filter", params["threat_level"]),
+        }
+
+    def get_ekfiddle_threats(
+        self,
+        *,
+        time_range_minutes: int = 120,
+        min_risk_score: float = 0.7,
+        categories: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return high-risk EKFiddle hits for triage."""
+        params: Dict[str, Any] = {
+            "time_range_minutes": max(1, min(int(time_range_minutes), 360)),
+            "min_risk_score": float(min_risk_score),
+        }
+        if categories:
+            params["categories"] = categories
+        try:
+            data = self.request("GET", "/api/sessions/ekfiddle/threats", params=params)
+        except BridgeConnectionError:
+            return {
+                "success": False,
+                "error": "Cannot connect to real-time bridge",
+                "bridge_status": "Disconnected",
+            }
+        except BridgeRequestError as exc:
+            return {"success": False, "error": f"EKFiddle threats request failed: {exc}"}
+
+        return {
+            "success": True,
+            "threats": data.get("threats", []),
+            "total_count": data.get("total_count", len(data.get("threats", []) or [])),
+            "critical_sessions": data.get("critical_sessions", []),
+            "critical_count": data.get("critical_count", 0),
+            "time_range_minutes": data.get("time_range_minutes", params["time_range_minutes"]),
+            "min_risk_score": data.get("min_risk_score", params["min_risk_score"]),
+            "categories_searched": data.get("categories_searched", []),
+        }
+
     def check_bridge_health(self) -> bool:
         """Lightweight reachability probe for the HTTP bridge."""
 
@@ -1183,6 +1270,48 @@ def fiddler_mcp__sessions_clear(
     """
 
     return client.clear_sessions(confirm=confirm, clear_suspicious=clear_suspicious)
+
+
+@mcp.tool()
+def fiddler_mcp__ekfiddle_sessions(
+    limit: Annotated[int, Field(description="Max EKFiddle-flagged sessions to return (1-500).", ge=1, le=500)] = 50,
+    time_range_minutes: Annotated[int, Field(description="Look back this many minutes (1-360).", ge=1, le=360)] = 60,
+    threat_level: Annotated[str, Field(description="Filter by severity: all, high, medium, or low.")] = "all",
+) -> Dict[str, Any]:
+    """List sessions that EKFiddle already flagged in the live buffer.
+
+    Prefer this for triage before fetching bodies. Each session includes
+    `ekfiddle_comment` and parsed analysis when available.
+
+    Example:
+        fiddler_mcp__ekfiddle_sessions(threat_level="high", time_range_minutes=120)
+    """
+    return client.get_ekfiddle_sessions(
+        limit=limit,
+        time_range_minutes=time_range_minutes,
+        threat_level=threat_level,
+    )
+
+
+@mcp.tool()
+def fiddler_mcp__ekfiddle_threats(
+    time_range_minutes: Annotated[int, Field(description="Look back this many minutes (1-360).", ge=1, le=360)] = 120,
+    min_risk_score: Annotated[float, Field(description="Minimum EKFiddle risk score 0.0-1.0.", ge=0.0, le=1.0)] = 0.7,
+    categories: Annotated[Optional[str], Field(description="Optional comma-separated threat categories, e.g. malware,phishing. Empty = all score matches.")] = None,
+) -> Dict[str, Any]:
+    """Return high-risk EKFiddle hits for prioritized investigation.
+
+    Use before session_body to pick Critical/High sessions. Includes risk_score,
+    threat_level, ekfiddle_comment, and critical_sessions subset.
+
+    Example:
+        fiddler_mcp__ekfiddle_threats(min_risk_score=0.65, time_range_minutes=60)
+    """
+    return client.get_ekfiddle_threats(
+        time_range_minutes=time_range_minutes,
+        min_risk_score=min_risk_score,
+        categories=categories,
+    )
 
 
 def _env(name: str, default: str) -> str:

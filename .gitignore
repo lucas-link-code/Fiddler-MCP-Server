@@ -1,8 +1,15 @@
 # Fiddler CustomRules - excluded to prevent accidental overwrites
 CustomRules.js
 
+# Local API keys / provider config (do not commit)
+gemini-fiddler-config.json
+
 # Analyst-generated EKFiddle output (do not commit live rules)
 generated_ekfiddle_rules.txt
+
+# Runtime logs and local backups
+mcp_server.err.log
+*.7z
 
 # Python
 __pycache__/

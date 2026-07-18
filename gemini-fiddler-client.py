@@ -48,6 +48,9 @@ except ImportError:
 # Package name in requirements -> import module name
 _REQ_IMPORT_MAP = {
     "google-generativeai": "google.generativeai",
+    "openai": "openai",
+    "certifi": "certifi",
+    "httpx": "httpx",
     "rich": "rich",
     "mcp": "mcp",
     "pydantic": "pydantic",
@@ -59,6 +62,8 @@ REQUIRED_SCRIPTS = (
     "enhanced-bridge.py",
     "5ire-bridge.py",
     "gemini_native_tools.py",
+    "llm_prompts.py",
+    "llm_tool_schema.py",
 )
 
 
@@ -115,6 +120,9 @@ def ensure_python_dependencies(script_dir: Optional[Path] = None, auto_install: 
         print(f"[!] {req_path.name} not found; checking core imports only")
         req_lines = [
             "google-generativeai==0.8.5",
+            "openai>=1.40.0",
+            "certifi>=2024.0.0",
+            "httpx>=0.27.0",
             "rich>=13.0.0",
             "mcp>=1.0.0",
             "pydantic>=2.0.0",
@@ -228,10 +236,13 @@ def bootstrap_runtime(auto_install: bool = True) -> bool:
         return False
     return True
 
-# Available Gemini models for selection (centralized for consistency)
-# Model IDs from https://ai.google.dev/gemini-api/docs/models (Gemini 3 / 2.5)
+# Available models (centralized). Numbers used by /model and first-run wizard.
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-AVAILABLE_MODELS = {
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_PROVIDER = "gemini"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+GEMINI_MODELS = {
     "1": "gemini-3-flash-preview",
     "2": "gemini-3.1-flash-lite",
     "3": "gemini-3.1-pro-preview",
@@ -244,20 +255,51 @@ AVAILABLE_MODELS = {
     "10": "gemini-1.5-flash",
     "11": "gemini-1.5-pro",
 }
+DEEPSEEK_MODELS = {
+    "12": "deepseek-v4-flash",
+    "13": "deepseek-v4-pro",
+}
+# Combined for backward-compatible /model number resolution
+AVAILABLE_MODELS = {**GEMINI_MODELS, **DEEPSEEK_MODELS}
+
+
+def provider_for_model(model_name: str) -> str:
+    if model_name in DEEPSEEK_MODELS.values() or str(model_name).startswith("deepseek-"):
+        return "deepseek"
+    return "gemini"
+
+
+def resolve_model_identifier(model_identifier: str) -> Optional[str]:
+    mid = (model_identifier or "").strip()
+    if mid in AVAILABLE_MODELS:
+        return AVAILABLE_MODELS[mid]
+    if mid in AVAILABLE_MODELS.values():
+        return mid
+    return None
 
 
 class GeminiFiddlerClient:
-    """Gemini-powered MCP client for Fiddler traffic analysis"""
+    """Fiddler MCP client with Gemini (default) or DeepSeek native tool backends."""
 
     def __init__(
         self,
         api_key: str,
         model_name: str = DEFAULT_GEMINI_MODEL,
         auto_save_full_bodies: bool = False,
+        provider: str = DEFAULT_PROVIDER,
+        deepseek_api_key: Optional[str] = None,
+        deepseek_base_url: str = DEEPSEEK_BASE_URL,
+        deepseek_ssl_verify: Any = True,
     ):
-        """Initialize client with Gemini API key"""
+        """Initialize client with LLM API credentials."""
         self.api_key = api_key
+        self.deepseek_api_key = deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or ""
+        self.deepseek_base_url = (deepseek_base_url or DEEPSEEK_BASE_URL).rstrip("/")
+        self.deepseek_ssl_verify = deepseek_ssl_verify
         self.model_name = model_name
+        self.provider_name = (provider or provider_for_model(model_name) or DEFAULT_PROVIDER).lower()
+        if self.provider_name not in ("gemini", "deepseek"):
+            self.provider_name = DEFAULT_PROVIDER
         self.mcp_process = None
         self.mcp_stderr_file = None
         self.request_id = 0
@@ -280,12 +322,17 @@ class GeminiFiddlerClient:
         self.bridge_url = os.environ.get("FIDDLER_BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
         self._current_user_query = ""
         self._mcp_server_command: Optional[List[str]] = None
-        # Native Gemini function calling (default on). Set GEMINI_NATIVE_TOOLS=0 for legacy text JSON loop.
+        # Native function calling (default on). Set GEMINI_NATIVE_TOOLS=0 for legacy text JSON loop.
+        # DeepSeek has no legacy text loop; native tools are always required for that provider.
         self.use_native_tools = os.environ.get("GEMINI_NATIVE_TOOLS", "1").strip().lower() not in {
             "0", "false", "no", "off",
         }
+        if self.provider_name == "deepseek":
+            self.use_native_tools = True
         self._gemini_tool = None
         self._system_instruction = ""
+        self.llm_provider = None
+        self.model = None
         
         if RICH_AVAILABLE:
             self.console = Console()
@@ -294,19 +341,42 @@ class GeminiFiddlerClient:
             self.console = None
             self.use_rich = False
         
+        self._init_llm_provider()
+        
+        print(f"Initialized {self.provider_name} / {model_name}")
+        if self.use_native_tools:
+            print(f"[*] Native tool schema binding enabled ({self.provider_name})")
+        if not RICH_AVAILABLE:
+            print("[!] Tip: Install 'rich' library for better formatting: pip install rich")
+
+    def _init_llm_provider(self) -> None:
+        """Create Gemini or DeepSeek provider for the configured model."""
+        if self.provider_name == "deepseek":
+            if not self.deepseek_api_key:
+                raise RuntimeError(
+                    "DeepSeek selected but no API key. Set deepseek_api_key in config "
+                    "or DEEPSEEK_API_KEY env."
+                )
+            self.use_native_tools = True
+            from llm_providers.deepseek_provider import DeepSeekProvider
+            self.llm_provider = DeepSeekProvider(
+                api_key=self.deepseek_api_key,
+                model_name=self.model_name,
+                base_url=self.deepseek_base_url,
+                ssl_verify=getattr(self, "deepseek_ssl_verify", True),
+            )
+            self.model = None
+            return
+
         if not GENAI_AVAILABLE or genai is None:
             raise RuntimeError(
                 "google-generativeai is not installed. "
                 "Run: python -m pip install -r requirements-gemini.txt"
             )
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
-        
-        print(f"Initialized Gemini {model_name}")
-        if self.use_native_tools:
-            print("[*] Native tool schema binding enabled (GEMINI_NATIVE_TOOLS=1)")
-        if not RICH_AVAILABLE:
-            print("[!] Tip: Install 'rich' library for better formatting: pip install rich")
+        from llm_providers.gemini_provider import GeminiProvider
+        self.llm_provider = GeminiProvider(api_key=self.api_key, model_name=self.model_name)
+        self.model = self.llm_provider.model
+        genai.configure(api_key=self.api_key)
 
     # Valid argument keys per tool (used by sanitizer)
     _TOOL_ARG_KEYS = {
@@ -1285,31 +1355,49 @@ class GeminiFiddlerClient:
         return tools
 
     def bind_gemini_tools(self) -> bool:
-        """Convert MCP tools to Gemini FunctionDeclarations and rebuild the model."""
-        import gemini_native_tools as native
+        """Bind MCP tools on the active LLM provider (Gemini or DeepSeek)."""
+        import llm_prompts
 
-        self._system_instruction = native.investigation_system_instruction(self.max_followups)
-        tool, errors = native.build_gemini_tool(self.available_tools)
-        if errors:
-            for err in errors:
-                self.log_with_timestamp(f"Tool bind skip: {err}", to_console=True, prefix="[!] ")
-        if not tool:
-            self.log_with_timestamp("No Gemini tools bound; falling back to text tool loop", to_console=True, prefix="[!] ")
+        if self.llm_provider is None:
+            self._init_llm_provider()
+
+        self._system_instruction = llm_prompts.investigation_system_instruction(self.max_followups)
+        ok = self.llm_provider.bind_tools(self.available_tools, self._system_instruction)
+        for err in getattr(self.llm_provider, "bind_errors", []) or []:
+            self.log_with_timestamp(f"Tool bind skip: {err}", to_console=True, prefix="[!] ")
+
+        if not ok:
+            if self.provider_name == "gemini":
+                self.log_with_timestamp(
+                    "No tools bound; falling back to text tool loop",
+                    to_console=True,
+                    prefix="[!] ",
+                )
+            else:
+                self.log_with_timestamp(
+                    "No tools bound for DeepSeek; native tools required",
+                    to_console=True,
+                    prefix="[!] ",
+                )
             self._gemini_tool = None
-            self.use_native_tools = False
-            self.model = genai.GenerativeModel(self.model_name)
+            # DeepSeek requires native tools; Gemini can fall back to legacy text loop
+            if self.provider_name == "gemini":
+                self.use_native_tools = False
+                if genai is not None:
+                    self.model = genai.GenerativeModel(self.model_name)
+            else:
+                self.use_native_tools = True
             return False
 
-        self._gemini_tool = tool
-        self.model = genai.GenerativeModel(
-            self.model_name,
-            tools=[tool],
-            system_instruction=self._system_instruction,
-        )
-        n = len(getattr(tool, "function_declarations", []) or [])
-        names = [d.name for d in (tool.function_declarations or [])]
-        print(f"[+] Bound {n} Gemini FunctionDeclarations: {', '.join(names)}")
-        self.log_with_timestamp(f"Bound Gemini tools: {names}", to_console=False)
+        self._gemini_tool = True  # truthy flag for legacy checks / tests
+        if self.provider_name == "gemini":
+            self.model = getattr(self.llm_provider, "model", getattr(self, "model", None))
+        names = []
+        if hasattr(self.llm_provider, "bound_tool_names"):
+            names = self.llm_provider.bound_tool_names()
+        label = getattr(self.llm_provider, "display_label", self.provider_name)
+        print(f"[+] Bound {len(names)} {label} tools: {', '.join(names)}")
+        self.log_with_timestamp(f"Bound {self.provider_name} tools: {names}", to_console=False)
         return True
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -2445,103 +2533,75 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         return any(indicator in text for indicator in markdown_indicators)
 
     def _chat_native(self, user_query: str) -> str:
-        """Native Gemini function-calling loop with MCP call_tool as execution gate."""
-        import gemini_native_tools as native
-        from google.generativeai import protos
+        """Native function-calling loop via active LLM provider + MCP call_tool gate."""
+        import llm_prompts
+
+        if self.llm_provider is None or not self.llm_provider.tools_bound():
+            return "Native tools are not bound. Re-run /model or restart the client."
+
+        provider = self.llm_provider
+        label = getattr(provider, "display_label", self.provider_name)
 
         query_start_time = time.time()
-        total_gemini_time = 0.0
+        total_llm_time = 0.0
         total_bridge_time = 0.0
         tool_call_count = 0
         max_calls = self.max_followups
 
         history_snip = self._format_recent_history()
-        user_text = (
-            f"Analyst question: {user_query}\n\n"
-            f"{self._analyzed_sessions_note()}\n\n"
-            f"Recent conversation:\n{history_snip}\n\n"
-            "Use tools as needed. Prefer ekfiddle_threats/ekfiddle_sessions for triage, "
-            "sessions_search for host hunts, session_body for deep analysis, "
-            "compare_sessions when asked to compare. "
-            "ZERO-HIT: after one missed host on a user IOC list, stop serial hunting; "
-            "report missing hosts and continue from bodies or prior findings. "
-            "EKFiddle rules: High:/Med:/Low: only, title-case names, compound high-signal "
-            "regexes with bounded quantifiers, The crucial/key pattern explanations, then "
-            "plain tab-separated rule lines and STOP. No bare eth_call, no _\\w{{7,8}}\\(\\), "
-            "no NitroPack/lazyload unless asked. Answer infection-chain questions from "
-            "prior evidence when bodies were already analyzed."
+        user_text = llm_prompts.native_user_turn_wrapper(
+            user_query,
+            self._analyzed_sessions_note(),
+            history_snip,
         )
-        contents: List[Any] = [
-            protos.Content(role="user", parts=[protos.Part(text=user_text)])
-        ]
+        conversation = provider.start_conversation(user_text)
 
         try:
             if self.show_progress:
-                print(f"  (Native tools: up to {max_calls} calls. Ctrl+C stops this chain)")
+                print(f"  (Native tools / {label}: up to {max_calls} calls. Ctrl+C stops this chain)")
 
             while tool_call_count < max_calls:
                 self._check_interrupt()
-                sys.stdout.write("\r  Waiting for Gemini LLM (native tools)...")
+                sys.stdout.write(f"\r  Waiting for {label} LLM (native tools)...")
                 sys.stdout.flush()
-                gemini_start = time.time()
-                response = self.model.generate_content(
-                    contents,
-                    tool_config=native.tool_config("AUTO"),
-                )
+                llm_start = time.time()
+                response = provider.generate(conversation, tool_choice="auto")
                 self._check_interrupt()
-                gemini_elapsed = time.time() - gemini_start
-                total_gemini_time += gemini_elapsed
-                sys.stdout.write(f"\r  [Gemini LLM] Response ({gemini_elapsed:.1f}s)                    \n")
+                llm_elapsed = time.time() - llm_start
+                total_llm_time += llm_elapsed
+                sys.stdout.write(f"\r  [{label} LLM] Response ({llm_elapsed:.1f}s)                    \n")
                 sys.stdout.flush()
 
-                calls = native.extract_function_calls(response)
-                text = native.extract_text_parts(response)
+                calls = provider.extract_tool_calls(response)
+                text = provider.extract_text(response)
 
                 # Fallback: legacy text JSON tool call if no native function_call parts
                 if not calls and text:
                     legacy = self.parse_gemini_response(text)
                     if legacy:
-                        calls = [{"name": legacy["tool"], "args": legacy.get("arguments") or {}}]
+                        calls = [{"name": legacy["tool"], "args": legacy.get("arguments") or {}, "id": None}]
 
                 if not calls:
                     final = text or "No response from model."
                     self.conversation_history.append({"role": "assistant", "content": final})
                     self.log_with_timestamp(
-                        f"Query Summary: native_tools, gemini={total_gemini_time:.1f}s, "
+                        f"Query Summary: native_tools/{self.provider_name}, llm={total_llm_time:.1f}s, "
                         f"bridge={total_bridge_time:.1f}s, tool_calls={tool_call_count}",
                         to_console=False,
                     )
                     return self._finalize_assistant_response(final)
 
-                model_content = native.model_content_from_response(response)
-                if model_content is not None:
-                    contents.append(model_content)
-                else:
-                    # Reconstruct model turn from extracted calls
-                    parts = []
-                    for c in calls:
-                        parts.append(
-                            protos.Part(
-                                function_call=protos.FunctionCall(
-                                    name=c["name"],
-                                    args=c.get("args") or {},
-                                )
-                            )
-                        )
-                    if text:
-                        parts.insert(0, protos.Part(text=text))
-                    contents.append(protos.Content(role="model", parts=parts))
+                provider.append_model_turn(conversation, response, calls, text)
 
                 if text and text.strip():
-                    # Show interim analyst notes
                     if self.use_rich and self.console:
-                        self.console.print("\n[bold cyan]< Gemini:[/bold cyan]")
+                        self.console.print(f"\n[bold cyan]< {label}:[/bold cyan]")
                         self.console.print(text)
                     else:
-                        print(f"\n< Gemini: {text}")
+                        print(f"\n< {label}: {text}")
                     self.maybe_persist_ekfiddle_rules(text)
 
-                response_parts = []
+                executed = []
                 for call in calls:
                     self._check_interrupt()
                     name = call["name"]
@@ -2562,44 +2622,31 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
                         "tool": name,
                         "content": json.dumps(result, indent=2, default=str)[:8000],
                     })
-                    response_parts.append(native.build_function_response_part(name, result))
+                    executed.append((name, args, result, call.get("id")))
 
-                nudge = (
-                    f"{self._analyzed_sessions_note()}\n"
-                    "Continue investigation or give the final answer. "
-                    "If user asked for EKFiddle rules and you have malicious SourceCode evidence, "
-                    "emit tab-separated rules now and stop calling tools."
-                )
-                response_parts.append(protos.Part(text=nudge))
-                contents.append(protos.Content(role="user", parts=response_parts))
+                nudge = llm_prompts.post_tool_nudge(self._analyzed_sessions_note())
+                provider.append_tool_results(conversation, executed, nudge)
 
             # Budget exhausted — force text-only synthesis
             self.log_with_timestamp(
                 f"Native tools: budget exhausted after {tool_call_count} calls",
                 to_console=False,
             )
-            synth_prompt = (
-                f"Tool call budget exhausted ({max_calls}). Do NOT call tools.\n"
-                f"User question: {user_query}\n"
-                f"{self._analyzed_sessions_note()}\n"
-                "Provide FINAL SYNTHESIS. If EKFiddle rules were requested, emit best "
-                "tab-separated CustomRegexes from evidence already gathered. Do not invent IOCs."
+            synth_prompt = llm_prompts.budget_synthesis_prompt(
+                user_query, self._analyzed_sessions_note(), max_calls
             )
-            contents.append(protos.Content(role="user", parts=[protos.Part(text=synth_prompt)]))
-            sys.stdout.write("\r  Waiting for Gemini LLM final synthesis...")
+            provider.append_user_text(conversation, synth_prompt)
+            sys.stdout.write(f"\r  Waiting for {label} LLM final synthesis...")
             sys.stdout.flush()
             synth_start = time.time()
-            synth_resp = self.model.generate_content(
-                contents,
-                tool_config=native.tool_config("NONE"),
-            )
-            total_gemini_time += time.time() - synth_start
-            sys.stdout.write(f"\r  [Gemini LLM] Final synthesis complete                    \n")
+            synth_resp = provider.generate(conversation, tool_choice="none")
+            total_llm_time += time.time() - synth_start
+            sys.stdout.write(f"\r  [{label} LLM] Final synthesis complete                    \n")
             sys.stdout.flush()
-            final = native.extract_text_parts(synth_resp) or "Tool budget reached."
+            final = provider.extract_text(synth_resp) or "Tool budget reached."
             self.conversation_history.append({"role": "assistant", "content": final})
             self.log_with_timestamp(
-                f"Query Summary: native_tools budget, gemini={total_gemini_time:.1f}s, "
+                f"Query Summary: native_tools/{self.provider_name} budget, llm={total_llm_time:.1f}s, "
                 f"bridge={total_bridge_time:.1f}s, total={time.time()-query_start_time:.1f}s, "
                 f"tool_calls={tool_call_count}",
                 to_console=False,
@@ -2608,7 +2655,6 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
 
         except KeyboardInterrupt:
             self.clear_interrupt()
-            # Ctrl+C can still kill an unprotected child on some hosts; recover immediately
             if not self.is_mcp_alive():
                 print("[!] MCP child died during interrupt; attempting restart...")
                 self.ensure_mcp_alive()
@@ -2650,6 +2696,21 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         
         # Add user query to history
         self.conversation_history.append({"role": "user", "content": user_query})
+
+        if self.provider_name == "deepseek":
+            # DeepSeek has no Gemini text-JSON legacy loop
+            self.use_native_tools = True
+            if self._gemini_tool is None or self.llm_provider is None or not self.llm_provider.tools_bound():
+                if self.available_tools:
+                    self.bind_gemini_tools()
+            if self.llm_provider is None or not self.llm_provider.tools_bound():
+                err = (
+                    "DeepSeek native tools are not bound. "
+                    "Re-run /model or restart after tools/list succeeds."
+                )
+                self.conversation_history.append({"role": "error", "content": err})
+                return err
+            return self._chat_native(user_query)
 
         if self.use_native_tools and self._gemini_tool is not None:
             return self._chat_native(user_query)
@@ -3062,7 +3123,8 @@ Do not emit any tool JSON."""
     def interactive_mode(self):
         """Run interactive chat session"""
         print("\n" + "=" * 70)
-        print("Gemini-Powered Fiddler Traffic Analyzer")
+        print("Fiddler Traffic Analyzer")
+        print(f"Provider: {self.provider_name}  Model: {self.model_name}")
         print("=" * 70)
         print("\nAsk questions about your Fiddler traffic in natural language!")
         print("Examples:")
@@ -3142,10 +3204,15 @@ Do not emit any tool JSON."""
                 
                 # Process natural language query
                 response = self.chat(user_input)
-                
+                label = (
+                    getattr(self.llm_provider, "display_label", self.provider_name)
+                    if self.llm_provider
+                    else self.provider_name
+                )
+
                 # Render response with rich formatting if available
                 if self.use_rich and self.console:
-                    self.console.print("\n[bold cyan]< Gemini:[/bold cyan]")
+                    self.console.print(f"\n[bold cyan]< {label}:[/bold cyan]")
                     # Detect if response is markdown and render accordingly
                     if self._looks_like_markdown(response):
                         md = Markdown(response)
@@ -3153,7 +3220,7 @@ Do not emit any tool JSON."""
                     else:
                         self.console.print(response)
                 else:
-                    print("\n< Gemini: ", end="", flush=True)
+                    print(f"\n< {label}: ", end="", flush=True)
                     print(response)
                 
             except KeyboardInterrupt:
@@ -3170,13 +3237,16 @@ Do not emit any tool JSON."""
         print("  /help         - Show this menu and example queries")
         print("  /stats        - Show bridge statistics")
         print("  /tools        - List available tools")
-        print("  /model        - Show/change Gemini model")
+        print("  /model        - Show/change LLM model (Gemini or DeepSeek)")
         print("  /history      - Show conversation history")
         print("  /clear        - Clear bridge capture buffers (live + suspicious)")
         print("  /clearchat    - Clear conversation history")
         print("  /investigate  - Hunt malicious traffic in the current buffer")
         print("  /investigate <host> - Same playbook, prioritize a host")
         print("  /quit         - Exit")
+        print("\nModels: Gemini default; DeepSeek via /model deepseek-v4-flash or deepseek-v4-pro")
+        print("        Missing DeepSeek key: /model will prompt and save it to gemini-fiddler-config.json")
+        print("        /investigate and EKFiddle authoring work on both providers")
 
     def show_help(self):
         """Show slash-command menu and example queries."""
@@ -3264,48 +3334,109 @@ Do not emit any tool JSON."""
         print("=" * 70)
 
     def show_models(self):
-        """Show available Gemini models and current selection"""
+        """Show available Gemini and DeepSeek models and current selection"""
         print("\n" + "=" * 70)
-        print("Available Gemini Models")
+        print("Available LLM Models")
         print("=" * 70)
-        print(f"\nCurrent model: {self.model_name}")
-        print("\nAvailable models:")
-        for num, name in AVAILABLE_MODELS.items():
+        print(f"\nCurrent: provider={self.provider_name} model={self.model_name}")
+        ds_status = "configured" if self.deepseek_api_key else "not set (will prompt on switch)"
+        print(f"DeepSeek API key: {ds_status}")
+        print("\nGemini:")
+        for num, name in GEMINI_MODELS.items():
+            marker = " <-- CURRENT" if name == self.model_name else ""
+            print(f"  {num}. {name}{marker}")
+        print("\nDeepSeek:")
+        for num, name in DEEPSEEK_MODELS.items():
             marker = " <-- CURRENT" if name == self.model_name else ""
             print(f"  {num}. {name}{marker}")
         print("\nTo switch: /model <number> or /model <name>")
-        print(f"Example: /model 1  or  /model {DEFAULT_GEMINI_MODEL}")
+        print(f"Example: /model 1  or  /model {DEFAULT_DEEPSEEK_MODEL}")
+        if not self.deepseek_api_key:
+            print("DeepSeek models will ask for an API key and save it to gemini-fiddler-config.json")
         print("=" * 70)
 
+    def prompt_and_save_deepseek_api_key(self) -> bool:
+        """Prompt for DeepSeek API key, save to config, and apply in-memory. Returns True if set."""
+        print("\nDeepSeek API key is required for this model.")
+        print("Get a key at: https://platform.deepseek.com/")
+        print(f"It will be saved to: {config_file_path().name}")
+        try:
+            key = input("\nPaste DeepSeek API key (or Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[!] Cancelled.")
+            return False
+        if not key:
+            print("[!] No key entered. Staying on current model.")
+            return False
+        if key.lower() in {"cancel", "q", "quit"}:
+            print("[!] Cancelled.")
+            return False
+        try:
+            path = merge_save_config({
+                "deepseek_api_key": key,
+                "deepseek_base_url": self.deepseek_base_url or DEEPSEEK_BASE_URL,
+            })
+            self.deepseek_api_key = key
+            print(f"[+] DeepSeek API key saved to {path.name}")
+            return True
+        except Exception as e:
+            print(f"[X] Failed to save config: {e}")
+            # Still allow in-memory use for this session
+            self.deepseek_api_key = key
+            print("[!] Using key for this session only (not persisted).")
+            return True
+
     def change_model(self, model_identifier: str):
-        """Switch to a different Gemini model at runtime"""
+        """Switch Gemini or DeepSeek model at runtime."""
         model_identifier = model_identifier.strip()
-        
-        # Resolve number to model name
-        if model_identifier in AVAILABLE_MODELS:
-            new_model = AVAILABLE_MODELS[model_identifier]
-        elif model_identifier in AVAILABLE_MODELS.values():
-            new_model = model_identifier
-        else:
+        new_model = resolve_model_identifier(model_identifier)
+        if not new_model:
             print(f"[X] Unknown model: {model_identifier}")
             print("    Use /model to see available options")
             return
-        
-        if new_model == self.model_name:
-            print(f"[*] Already using {new_model}")
+
+        new_provider = provider_for_model(new_model)
+        if new_model == self.model_name and new_provider == self.provider_name:
+            print(f"[*] Already using {self.provider_name} / {new_model}")
             return
-        
+
+        if new_provider == "deepseek" and not self.deepseek_api_key:
+            if not self.prompt_and_save_deepseek_api_key():
+                return
+
+        if new_provider == "gemini" and not self.api_key:
+            print("[X] Gemini API key not configured.")
+            print("    Add api_key to gemini-fiddler-config.json or set GEMINI_API_KEY")
+            return
+
         old_model = self.model_name
+        old_provider = self.provider_name
         try:
             self.model_name = new_model
+            self.provider_name = new_provider
+            self._init_llm_provider()
             if self.use_native_tools and self.available_tools:
                 if not self.bind_gemini_tools():
-                    self.model = genai.GenerativeModel(new_model)
-            else:
-                self.model = genai.GenerativeModel(new_model)
-            print(f"[+] Switched from {old_model} to {new_model}")
+                    if self.provider_name == "gemini" and genai is not None:
+                        self.model = genai.GenerativeModel(new_model)
+            # Persist last selected model/provider when config exists or was just created
+            try:
+                merge_save_config({
+                    "model": self.model_name,
+                    "provider": self.provider_name,
+                })
+            except Exception:
+                pass
+            print(f"[+] Switched from {old_provider}/{old_model} to {self.provider_name}/{new_model}")
         except Exception as e:
             self.model_name = old_model
+            self.provider_name = old_provider
+            try:
+                self._init_llm_provider()
+                if self.use_native_tools and self.available_tools:
+                    self.bind_gemini_tools()
+            except Exception:
+                pass
             print(f"[X] Failed to switch model: {e}")
 
     def close(self):
@@ -3326,27 +3457,59 @@ Do not emit any tool JSON."""
         print(f"Queries processed: {len([h for h in self.conversation_history if h.get('role') == 'user'])}")
 
 
+def config_file_path() -> Path:
+    return Path(__file__).resolve().parent / "gemini-fiddler-config.json"
+
+
+def merge_save_config(updates: Dict[str, Any]) -> Path:
+    """Merge keys into gemini-fiddler-config.json and write it. Returns path."""
+    path = config_file_path()
+    config: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                config = loaded
+        except Exception:
+            config = {}
+    config.update(updates)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    return path
+
+
 def load_config() -> Dict[str, str]:
     """Load configuration from file or environment"""
-    config_file = Path(__file__).parent / "gemini-fiddler-config.json"
+    config_file = config_file_path()
     
     # Try to load from config file
     if config_file.exists():
         try:
             with open(config_file) as f:
                 config = json.load(f)
-                if config.get("api_key"):
+                if config.get("api_key") or config.get("deepseek_api_key"):
                     config.setdefault("auto_save_full_bodies", False)
+                    config.setdefault("provider", provider_for_model(config.get("model", DEFAULT_GEMINI_MODEL)))
                     return config
         except Exception:
             pass
     
     # Try environment variable
     api_key = os.getenv("GEMINI_API_KEY")
-    if api_key:
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+    model = os.getenv("GEMINI_MODEL") or os.getenv("DEEPSEEK_MODEL") or DEFAULT_GEMINI_MODEL
+    if provider == "deepseek" and not os.getenv("GEMINI_MODEL"):
+        model = os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+    if api_key or deepseek_key:
         return {
-            "api_key": api_key,
-            "model": os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+            "api_key": api_key or "",
+            "deepseek_api_key": deepseek_key or "",
+            "provider": provider if provider in ("gemini", "deepseek") else provider_for_model(model),
+            "model": model,
+            "deepseek_base_url": os.getenv("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL),
             "auto_save_full_bodies": os.getenv("GEMINI_AUTO_SAVE_FULL_BODIES", "false").lower() in {"1", "true", "yes", "on"},
         }
     
@@ -3356,49 +3519,48 @@ def load_config() -> Dict[str, str]:
 def create_config_file():
     """Interactive config file creation"""
     print("\n" + "=" * 70)
-    print("Gemini Fiddler Client - Configuration Setup")
+    print("Fiddler MCP Client - Configuration Setup")
     print("=" * 70)
     print("\nNo configuration found. Let's set it up!")
     print("\n1. Get your Gemini API key:")
-    print("   https://makersuite.google.com/app/apikey")
-    print("\n2. Enter your API key below:")
+    print("   https://aistudio.google.com/apikey")
+    print("\n2. Enter your Gemini API key (required for default Gemini provider):")
     
     api_key = input("\nGemini API Key: ").strip()
     
-    if not api_key:
-        print("[X] No API key provided. Exiting.")
+    print("\n3. Optional DeepSeek API key (for deepseek-v4-flash / deepseek-v4-pro):")
+    print("   https://platform.deepseek.com/")
+    deepseek_api_key = input("\nDeepSeek API Key [Enter to skip]: ").strip()
+
+    if not api_key and not deepseek_api_key:
+        print("[X] Need at least one API key (Gemini or DeepSeek). Exiting.")
         sys.exit(1)
     
-    print("\n3. Select Gemini model:")
-    print("\n   DEFAULT / RECOMMENDED (Gemini 3):")
+    print("\n4. Select default model:")
+    print("\n   GEMINI (default provider):")
     print("   1. gemini-3-flash-preview (DEFAULT)")
-    print("   2. gemini-3.1-flash-lite (fast, cost efficient)")
-    print("   3. gemini-3.1-pro-preview (most capable Gemini 3)")
-    print("   4. gemini-3.5-flash (stable Gemini 3.5)")
-    print("\n   GEMINI 2.5:")
+    print("   2. gemini-3.1-flash-lite")
+    print("   3. gemini-3.1-pro-preview")
+    print("   4. gemini-3.5-flash")
     print("   5. gemini-2.5-flash")
     print("   6. gemini-2.5-pro")
     print("   7. gemini-2.5-flash-lite")
-    print("\n   LEGACY (may be deprecated):")
-    print("   8. gemini-2.0-flash")
-    print("   9. gemini-2.0-flash-lite")
-    print("   10. gemini-1.5-flash")
-    print("   11. gemini-1.5-pro")
-    print("\n   Enter number (1-11) or full model name")
+    print("\n   DEEPSEEK:")
+    print("   12. deepseek-v4-flash")
+    print("   13. deepseek-v4-pro")
+    print("\n   Enter number or full model name")
     
     model_choice = input(f"\nModel [1 for {DEFAULT_GEMINI_MODEL}]: ").strip() or "1"
+    model = resolve_model_identifier(model_choice) or model_choice
+    provider = provider_for_model(model)
+    if provider == "deepseek" and not deepseek_api_key:
+        print("[X] DeepSeek model selected but no DeepSeek API key. Exiting.")
+        sys.exit(1)
+    if provider == "gemini" and not api_key:
+        print("[X] Gemini model selected but no Gemini API key. Exiting.")
+        sys.exit(1)
     
-    # Get model name from choice (uses centralized AVAILABLE_MODELS constant)
-    if model_choice in AVAILABLE_MODELS:
-        model = AVAILABLE_MODELS[model_choice]
-    elif model_choice in AVAILABLE_MODELS.values():
-        # User entered a model name directly
-        model = model_choice
-    else:
-        # Unknown model name, use as-is (user may know a newer model)
-        model = model_choice
-    
-    print(f"\n[+] Selected model: {model}")
+    print(f"\n[+] Selected provider={provider} model={model}")
     
     # Detect OS and use appropriate Python command
     import platform
@@ -3409,13 +3571,17 @@ def create_config_file():
 
     config = {
         "api_key": api_key,
+        "deepseek_api_key": deepseek_api_key,
+        "provider": provider,
         "model": model,
+        "deepseek_base_url": DEEPSEEK_BASE_URL,
+        "deepseek_ssl_verify": True,
         "auto_save_full_bodies": auto_save_full_bodies,
         "mcp_server_command": [python_cmd, "5ire-bridge.py"],
         "bridge_url": "http://127.0.0.1:8081"
     }
     
-    config_file = Path(__file__).parent / "gemini-fiddler-config.json"
+    config_file = config_file_path()
     try:
         with open(config_file, "w") as f:
             json.dump(config, f, indent=2)
@@ -3423,7 +3589,7 @@ def create_config_file():
         return config
     except Exception as e:
         print(f"\n[X] Failed to save config: {e}")
-        print("You can set the GEMINI_API_KEY environment variable instead.")
+        print("You can set GEMINI_API_KEY / DEEPSEEK_API_KEY environment variables instead.")
         return config
 
 
@@ -3432,7 +3598,7 @@ def main():
     import platform
     import signal
 
-    print("\nGemini-Powered Fiddler Traffic Analyzer")
+    print("\nFiddler Traffic Analyzer (Gemini default, DeepSeek optional)")
     print("=" * 70)
 
     # 1) Check / install Python deps and verify companion scripts
@@ -3467,19 +3633,34 @@ def main():
     try:
         # Load or create configuration
         config = load_config()
-        if not config.get("api_key"):
+        if not config.get("api_key") and not config.get("deepseek_api_key"):
             config = create_config_file()
-        
-        api_key = config.get("api_key")
+
         model = config.get("model", DEFAULT_GEMINI_MODEL)
-        
-        # Initialize client
+        provider = (config.get("provider") or provider_for_model(model) or DEFAULT_PROVIDER).lower()
+        api_key = config.get("api_key") or ""
+        deepseek_api_key = config.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY") or ""
+
+        if provider == "deepseek" and not deepseek_api_key:
+            print("[X] DeepSeek provider selected but deepseek_api_key / DEEPSEEK_API_KEY missing.")
+            sys.exit(1)
+        if provider == "gemini" and not api_key:
+            print("[X] Gemini provider selected but api_key / GEMINI_API_KEY missing.")
+            sys.exit(1)
+
         auto_save_bodies = config.get("auto_save_full_bodies", False)
 
         client = GeminiFiddlerClient(
             api_key=api_key,
             model_name=model,
             auto_save_full_bodies=auto_save_bodies,
+            provider=provider,
+            deepseek_api_key=deepseek_api_key,
+            deepseek_base_url=config.get("deepseek_base_url", DEEPSEEK_BASE_URL),
+            deepseek_ssl_verify=config.get(
+                "deepseek_ssl_verify",
+                os.getenv("DEEPSEEK_SSL_VERIFY", "1"),
+            ),
         )
         if config.get("bridge_url"):
             client.bridge_url = str(config["bridge_url"]).rstrip("/")

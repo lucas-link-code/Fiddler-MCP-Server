@@ -2,7 +2,7 @@ Native Gemini Tool Binding - Manual Soak Checklist
 ==================================================
 
 Run after deploy with enhanced-bridge + 5ire-bridge + gemini-fiddler-client.
-Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini FunctionDeclarations.
+Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini tools when provider=gemini.
 
 1. Triage
    Ask: show high ekfiddle threats from the last hour
@@ -59,6 +59,42 @@ Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini
     Media session_body requests should be skipped with a media hint
 
 11. Legacy fallback
-    Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop
+    Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop on Gemini
+
+DeepSeek provider parity
+========================
+
+Requires deepseek_api_key or DEEPSEEK_API_KEY. Gemini remains default until /model switches.
+
+D1. Gemini default still boots
+    Start client with provider gemini; /investigate completes with tool calls
+
+D2. Flash investigate
+    /model deepseek-v4-flash (or /model 12)
+    Expect: Bound N DeepSeek tools
+    /investigate completes with tool calls (ekfiddle_threats / session_body etc.)
+
+D3. Pro EKFiddle authoring
+    /model deepseek-v4-pro (or /model 13)
+    Ask: create EKFiddle rules for malicious code in a named session
+    Expect: tab-separated rules + generated_ekfiddle_rules.txt update
+
+D4. Refetch / zero-hit / slash under DeepSeek
+    Confirm refetch lock, zero-hit budget, /clear, /clearchat still work
+
+D5. Mid-session switch back to Gemini
+    /model gemini-3-flash-preview (or /model 1) without restart
+    Expect: Bound N Gemini tools; next query uses Gemini
+
+D6. Missing DeepSeek key
+    Without deepseek_api_key, /model deepseek-v4-flash prompts for the key and saves it
+
+D7. Connection error to api.deepseek.com
+    Symptom: Error processing query (native tools): Connection error / DeepSeek API error
+    Cause: analysis VM cannot reach https://api.deepseek.com (no internet, firewall, or proxy)
+    Check: curl -I https://api.deepseek.com
+    Fix: run client on a host with outbound HTTPS, or set HTTPS_PROXY if corporate proxy is required
+    Note: MCP bridges on 127.0.0.1 can still work while DeepSeek cloud calls fail
 
 Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.
+Rollback tag if needed: pre-deepseek-restore

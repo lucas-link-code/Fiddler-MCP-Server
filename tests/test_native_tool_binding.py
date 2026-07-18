@@ -339,18 +339,24 @@ class TestNativeChatHelpers(unittest.TestCase):
     def test_bind_rebuilds_model(self):
         client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
         client.model_name = "gemini-3-flash-preview"
+        client.provider_name = "gemini"
+        client.api_key = "test-key"
         client.max_followups = 20
         client.available_tools = SAMPLE_TOOLS
         client.use_native_tools = True
         client.log_with_timestamp = MagicMock()
         with patch.object(gemini.genai, "GenerativeModel", return_value=MagicMock()) as gm:
+            from llm_providers.gemini_provider import GeminiProvider
+            client.llm_provider = GeminiProvider(api_key="test-key", model_name=client.model_name)
             ok = client.bind_gemini_tools()
             self.assertTrue(ok)
-            self.assertIsNotNone(client._gemini_tool)
+            self.assertTrue(client._gemini_tool)
             gm.assert_called()
             kwargs = gm.call_args.kwargs
             self.assertIn("tools", kwargs)
             self.assertIn("system_instruction", kwargs)
+            self.assertIn("INVESTIGATE CAPTURE", kwargs["system_instruction"])
+            self.assertIn("EKFIDDLE RULE AUTHORING", kwargs["system_instruction"])
 
     def test_system_instruction_has_ekfiddle(self):
         text = native.investigation_system_instruction(10)
@@ -362,6 +368,13 @@ class TestNativeChatHelpers(unittest.TestCase):
         self.assertIn("Never write Medium:", text)
         self.assertIn("INVESTIGATE CAPTURE", text)
         self.assertIn("Do not author CustomRegexes for confirmed FP", text)
+
+    def test_shared_prompts_module(self):
+        import llm_prompts
+        text = llm_prompts.investigation_system_instruction(10)
+        self.assertIn("INVESTIGATE CAPTURE", text)
+        self.assertIn("EKFIDDLE RULE AUTHORING", text)
+        self.assertEqual(text, native.investigation_system_instruction(10))
 
 
 class TestProtoCoercion(unittest.TestCase):
@@ -404,7 +417,8 @@ class TestNativeChatLoop(unittest.TestCase):
     def test_sequential_tool_execution_order(self):
         client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
         client.use_native_tools = True
-        client._gemini_tool = object()
+        client._gemini_tool = True
+        client.provider_name = "gemini"
         client.max_followups = 5
         client.show_progress = False
         client.conversation_history = []
@@ -429,25 +443,50 @@ class TestNativeChatLoop(unittest.TestCase):
 
         client.call_tool = fake_call
 
-        # First response: two function calls; second: final text only
-        call_parts = [
-            types.SimpleNamespace(function_call=types.SimpleNamespace(name="fiddler_mcp__live_stats", args={}), text=None),
-            types.SimpleNamespace(function_call=types.SimpleNamespace(name="fiddler_mcp__session_body", args={"session_id": "1"}), text=None),
+        class FakeProvider:
+            display_label = "Gemini"
+
+            def tools_bound(self):
+                return True
+
+            def start_conversation(self, user_text):
+                return [{"role": "user", "content": user_text}]
+
+            def generate(self, conversation, tool_choice="auto"):
+                return self._queue.pop(0)
+
+            def extract_tool_calls(self, response):
+                return list(response.get("calls") or [])
+
+            def extract_text(self, response):
+                return response.get("text") or ""
+
+            def append_model_turn(self, conversation, response, calls, text):
+                conversation.append({"role": "assistant", "calls": calls, "text": text})
+
+            def append_tool_results(self, conversation, executed, nudge):
+                conversation.append({"role": "tool_batch", "n": len(executed)})
+
+            def append_user_text(self, conversation, text):
+                conversation.append({"role": "user", "content": text})
+
+        provider = FakeProvider()
+        provider._queue = [
+            {
+                "calls": [
+                    {"name": "fiddler_mcp__live_stats", "args": {}, "id": "1"},
+                    {"name": "fiddler_mcp__session_body", "args": {"session_id": "1"}, "id": "2"},
+                ],
+                "text": "",
+            },
+            {"calls": [], "text": "done"},
         ]
-        resp1 = types.SimpleNamespace(
-            candidates=[types.SimpleNamespace(content=types.SimpleNamespace(parts=call_parts))],
-            text=None,
-        )
-        resp2 = types.SimpleNamespace(
-            candidates=[types.SimpleNamespace(content=types.SimpleNamespace(parts=[types.SimpleNamespace(text="done", function_call=None)]))],
-            text="done",
-        )
-        client.model = MagicMock()
-        client.model.generate_content = MagicMock(side_effect=[resp1, resp2])
+        client.llm_provider = provider
 
         out = client._chat_native("get stats then body of 1")
         self.assertEqual(order, ["fiddler_mcp__live_stats", "fiddler_mcp__session_body"])
         self.assertIn("done", out)
+
     def test_legacy_prompt_notes_native_preference(self):
         client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
         client.available_tools = SAMPLE_TOOLS

@@ -10,6 +10,7 @@ generated_ekfiddle_rules.txt
 # Runtime logs and local backups
 mcp_server.err.log
 *.7z
+*.zip
 
 # Python
 __pycache__/

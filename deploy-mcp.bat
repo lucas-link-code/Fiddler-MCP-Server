@@ -39,21 +39,26 @@ echo   Fiddler MCP One-Click Deployment
 echo ============================================================================
 echo.
 echo This script will:
-echo   1. Check Python installation
+echo   1. Check Python and required runtime files
 echo   2. Find your Fiddler installation
 echo   3. Install required dependencies
-echo   4. Configure Gemini API settings
+echo   4. Write stub config if missing ^(API keys entered in client^)
 echo   5. Deploy CustomRules.js to Fiddler
-echo   6. Launch all MCP services
+echo   6. Launch bridge + client ^(5ire-bridge is owned by the client^)
 echo.
 echo ============================================================================
 echo.
 
-REM Step 1: Check Python
+REM Step 1: Check Python + runtime files
 echo [1/6] Checking Python installation...
 call :CHECK_PYTHON
 if errorlevel 1 goto :ERROR_PYTHON_NOT_FOUND
 echo [+] Python %PYTHON_VERSION% detected
+echo.
+echo    Verifying runtime files...
+call :CHECK_RUNTIME_FILES
+if errorlevel 1 goto :ERROR_RUNTIME_FILES
+echo [+] Runtime files present
 echo.
 
 REM Step 2: Find Fiddler
@@ -66,7 +71,7 @@ echo.
 REM Step 3: Install dependencies
 echo [3/6] Installing Python dependencies...
 echo    Checking if dependencies are already installed...
-python -c "import google.generativeai, rich, mcp, pydantic, flask, requests" >nul 2>&1
+python -c "import google.generativeai, rich, mcp, pydantic, flask, requests, openai, httpx, certifi" >nul 2>&1
 if not errorlevel 1 (
     echo [+] All dependencies already installed, skipping installation
     echo.
@@ -82,7 +87,7 @@ if errorlevel 1 goto :ERROR_DEPS_FAILED
 echo [+] All dependencies ready
 echo.
 
-REM Step 4: Configuration wizard
+REM Step 4: Stub configuration ^(no API key prompt here^)
 echo [4/6] Checking configuration...
 call :CONFIG_WIZARD
 if errorlevel 1 goto :ERROR_CONFIG_FAILED
@@ -108,15 +113,20 @@ echo ===========================================================================
 echo   DEPLOYMENT SUCCESSFUL
 echo ============================================================================
 echo.
-echo Three console windows are now open:
-echo   1. THIS WINDOW - Deployment status and instructions
+echo Install directory: %~dp0
+echo.
+echo Console windows:
+echo   1. THIS WINDOW - Deployment status
 echo   2. Fiddler MCP Bridge - HTTP server on port 8081
-echo   3. Gemini Fiddler Client - Interactive chat interface
+echo   3. Gemini Fiddler Client - Interactive chat
+echo.
+echo 5ire-bridge.py runs inside the client as the MCP child. No separate console.
 echo.
 echo NEXT STEPS:
-echo   1. In Fiddler, go to Rules ^> Reload Script (or press Ctrl+R)
-echo   2. Switch to the "Gemini Fiddler Client" window
-echo   3. Start analyzing your traffic with natural language queries
+echo   1. In Fiddler, Rules ^> Reload Script ^(Ctrl+R^)
+echo   2. Switch to Gemini Fiddler Client and enter an API key when prompted
+echo   3. Optional later: /model 12 DeepSeek, /model 14 OpenRouter
+echo   4. Day-to-day restart: start-fiddler-mcp.bat
 echo.
 echo EXAMPLE QUERIES:
 echo   - Show me recent sessions from the last 5 minutes
@@ -124,11 +134,53 @@ echo   - Are there any suspicious sessions?
 echo   - Analyze session 123 for malicious behavior
 echo   - Search for JavaScript files from example.com
 echo.
-echo To stop all services, close all three console windows.
+echo To stop services, close the bridge and client console windows.
 echo.
 echo ============================================================================
 echo.
+if /i "%DEPLOY_FROM_SETUP%"=="1" (
+    exit /b 0
+)
+if /i "%DEPLOY_NO_PAUSE%"=="1" (
+    exit /b 0
+)
 pause
+exit /b 0
+REM ============================================================================
+REM SUBROUTINE: CHECK_RUNTIME_FILES
+REM Fail early if the install directory is incomplete
+REM ============================================================================
+:CHECK_RUNTIME_FILES
+set "MISSING=0"
+for %%F in (
+    CustomRules.js
+    enhanced-bridge.py
+    5ire-bridge.py
+    gemini-fiddler-client.py
+    gemini_native_tools.py
+    llm_prompts.py
+    llm_tool_schema.py
+    requirements-gemini.txt
+    start-fiddler-mcp.bat
+) do (
+    if not exist "%~dp0%%F" (
+        echo    MISSING: %%F
+        set "MISSING=1"
+    )
+)
+for %%F in (
+    __init__.py
+    base.py
+    gemini_provider.py
+    deepseek_provider.py
+    openrouter_provider.py
+) do (
+    if not exist "%~dp0llm_providers\%%F" (
+        echo    MISSING: llm_providers\%%F
+        set "MISSING=1"
+    )
+)
+if "!MISSING!"=="1" exit /b 1
 exit /b 0
 
 REM ============================================================================
@@ -324,44 +376,24 @@ if errorlevel 1 (
 )
 
 echo.
-echo    Installing Gemini dependencies...
-if exist "%~dp0requirements-gemini.txt" (
-    echo    Using requirements-gemini.txt
-    python -m pip install -r "%~dp0requirements-gemini.txt"
-    set DEPS_RESULT=!ERRORLEVEL!
-) else (
-    echo    Installing: google-generativeai rich
-    python -m pip install google-generativeai rich
-    set DEPS_RESULT=!ERRORLEVEL!
-)
-if !DEPS_RESULT! NEQ 0 (
-    echo.
-    echo    ERROR: Failed to install Gemini dependencies
-    echo           Exit code: !DEPS_RESULT!
+echo    Installing dependencies from requirements-gemini.txt...
+if not exist "%~dp0requirements-gemini.txt" (
+    echo    ERROR: requirements-gemini.txt not found
     exit /b 1
 )
-
-echo.
-echo    Installing MCP dependencies...
-if exist "%~dp0requirements-mcp.txt" (
-    echo    Using requirements-mcp.txt
-    python -m pip install -r "%~dp0requirements-mcp.txt"
-    set DEPS_RESULT=!ERRORLEVEL!
-) else (
-    echo    Installing: mcp pydantic Flask requests
-    python -m pip install mcp pydantic Flask requests
-    set DEPS_RESULT=!ERRORLEVEL!
-)
+python -m pip install -r "%~dp0requirements-gemini.txt"
+set DEPS_RESULT=!ERRORLEVEL!
 if !DEPS_RESULT! NEQ 0 (
     echo.
-    echo    ERROR: Failed to install MCP dependencies
+    echo    ERROR: Failed to install dependencies
     echo           Exit code: !DEPS_RESULT!
+    echo           Try install-dependencies-manual.bat
     exit /b 1
 )
 
 echo.
 echo    Verifying installations...
-python -c "import google.generativeai; import rich; import mcp; import pydantic; import flask; import requests; print('All packages verified')"
+python -c "import google.generativeai, rich, mcp, pydantic, flask, requests, openai, httpx, certifi; print('All packages verified')"
 if errorlevel 1 (
     echo    WARNING: Some packages failed to import
     echo             The system may not work correctly
@@ -374,99 +406,44 @@ exit /b 0
 
 REM ============================================================================
 REM SUBROUTINE: CONFIG_WIZARD
-REM Interactive configuration setup for first-time users
+REM Write stub config with empty API keys. Client prompts for keys on start.
 REM ============================================================================
 :CONFIG_WIZARD
 set CONFIG_FILE=%~dp0gemini-fiddler-config.json
 
-REM Check if config already exists
 if exist "%CONFIG_FILE%" (
     echo    Using existing configuration: %CONFIG_FILE%
     exit /b 0
 )
 
-echo.
-echo    ========================================================================
-echo    First-Time Configuration
-echo    ========================================================================
-echo.
-echo    You need a Gemini API key to use this system.
-echo.
-echo    Get your FREE API key here:
-echo      https://makersuite.google.com/app/apikey
-echo.
-echo    (The browser will open if you press Enter without entering a key)
-echo.
-set /p GEMINI_API_KEY="    Enter your Gemini API key: "
-
-REM If empty, open browser to API key page
-if "!GEMINI_API_KEY!"=="" (
-    echo    Opening browser to get API key...
-    start https://makersuite.google.com/app/apikey
-    echo.
-    set /p GEMINI_API_KEY="    Enter your Gemini API key: "
-)
-
-REM Validate API key format (basic check)
-if "!GEMINI_API_KEY!"=="" (
-    echo    ERROR: API key is required
-    exit /b 1
-)
-
-echo.
-echo    Select Gemini model:
-echo.
-echo    DEFAULT / RECOMMENDED (Gemini 3):
-echo      1. gemini-3-flash-preview (DEFAULT)
-echo      2. gemini-3.1-flash-lite
-echo      3. gemini-3.1-pro-preview
-echo      4. gemini-3.5-flash
-echo.
-echo    GEMINI 2.5:
-echo      5. gemini-2.5-flash
-echo      6. gemini-2.5-pro
-echo      7. gemini-2.5-flash-lite
-echo.
-set /p MODEL_CHOICE="    Select model [1]: "
-if "!MODEL_CHOICE!"=="" set MODEL_CHOICE=1
-
-REM Map choice to model name
-if "!MODEL_CHOICE!"=="1" set GEMINI_MODEL=gemini-3-flash-preview
-if "!MODEL_CHOICE!"=="2" set GEMINI_MODEL=gemini-3.1-flash-lite
-if "!MODEL_CHOICE!"=="3" set GEMINI_MODEL=gemini-3.1-pro-preview
-if "!MODEL_CHOICE!"=="4" set GEMINI_MODEL=gemini-3.5-flash
-if "!MODEL_CHOICE!"=="5" set GEMINI_MODEL=gemini-2.5-flash
-if "!MODEL_CHOICE!"=="6" set GEMINI_MODEL=gemini-2.5-pro
-if "!MODEL_CHOICE!"=="7" set GEMINI_MODEL=gemini-2.5-flash-lite
-
-REM If invalid choice, default to gemini-3-flash-preview
-if "!GEMINI_MODEL!"=="" set GEMINI_MODEL=gemini-3-flash-preview
-
-echo.
-set /p AUTO_SAVE="    Auto-save full response bodies to disk? [N]: "
-if /i "!AUTO_SAVE!"=="Y" (
-    set AUTO_SAVE_BODIES=true
-) else (
-    set AUTO_SAVE_BODIES=false
-)
-
-REM Create config JSON file
-echo    Creating configuration file...
+echo    Creating stub configuration ^(no API keys yet^)...
 (
 echo {
-echo   "api_key": "!GEMINI_API_KEY!",
-echo   "model": "!GEMINI_MODEL!",
-echo   "auto_save_full_bodies": !AUTO_SAVE_BODIES!,
+echo   "api_key": "",
+echo   "deepseek_api_key": "",
+echo   "openrouter_api_key": "",
+echo   "provider": "gemini",
+echo   "model": "gemini-3-flash-preview",
+echo   "deepseek_base_url": "https://api.deepseek.com",
+echo   "openrouter_base_url": "https://openrouter.ai/api/v1",
+echo   "deepseek_ssl_verify": true,
+echo   "openrouter_ssl_verify": true,
+echo   "auto_save_full_bodies": false,
 echo   "mcp_server_command": ["python", "5ire-bridge.py"],
 echo   "bridge_url": "http://127.0.0.1:8081"
 echo }
 ) > "%CONFIG_FILE%"
 
-echo    Configuration saved to: %CONFIG_FILE%
+if not exist "%CONFIG_FILE%" (
+    echo    ERROR: Failed to write stub config
+    exit /b 1
+)
+
+echo    Stub config saved to: %CONFIG_FILE%
+echo    Enter API keys in the Gemini Fiddler Client window when it starts.
 echo.
 
 exit /b 0
-
 REM ============================================================================
 REM SUBROUTINE: DEPLOY_CUSTOMRULES
 REM Copies CustomRules.js to Fiddler Scripts directory
@@ -611,9 +588,9 @@ if not exist "%~dp05ire-bridge.py" (
     exit /b 1
 )
 
-REM Launch enhanced bridge in new window
+REM Launch enhanced bridge in new window (safer quoting for paths with spaces)
 echo    Starting Enhanced Bridge (port 8081)...
-start "Fiddler MCP Bridge (Port 8081)" cmd /k "cd /d "%~dp0" && python enhanced-bridge.py"
+start "Fiddler MCP Bridge (Port 8081)" /D "%~dp0" cmd /k python enhanced-bridge.py
 if errorlevel 1 (
     echo    ERROR: Failed to start Enhanced Bridge
     echo           Check if cmd.exe is available
@@ -645,9 +622,10 @@ if %ERRORLEVEL% EQU 0 (
     echo    Check the "Fiddler MCP Bridge" window to verify it started
 )
 
-REM Launch Gemini client in new window
+REM Launch client; it starts 5ire-bridge.py as MCP child over stdin/stdout
 echo    Starting Gemini Fiddler Client...
-start "Gemini Fiddler Client" cmd /k "cd /d "%~dp0" && python gemini-fiddler-client.py"
+echo    Note: 5ire-bridge.py starts inside this client ^(MCP child^). No third console.
+start "Gemini Fiddler Client" /D "%~dp0" cmd /k python gemini-fiddler-client.py
 if errorlevel 1 (
     echo    ERROR: Failed to start Gemini Client
     echo           Check if cmd.exe is available
@@ -660,10 +638,26 @@ echo    Waiting for client to initialize (2 seconds)...
 timeout /t 2 /nobreak >nul
 
 exit /b 0
-
 REM ============================================================================
 REM ERROR HANDLERS
 REM ============================================================================
+
+:ERROR_RUNTIME_FILES
+cls
+echo ============================================================================
+echo   ERROR: Incomplete Install Directory
+echo ============================================================================
+echo.
+echo One or more required runtime files are missing from:
+echo   %~dp0
+echo.
+echo Re-run Fiddler-MCP-Setup.bat with Fiddler-MCP-Bundle.zip, or copy the
+echo full package including llm_providers\ and CustomRules.js.
+echo.
+echo ============================================================================
+echo.
+pause
+exit /b 1
 
 :ERROR_PYTHON_NOT_FOUND
 cls
@@ -799,15 +793,13 @@ echo ===========================================================================
 echo   ERROR: Configuration Failed
 echo ============================================================================
 echo.
-echo Could not create or validate configuration.
+echo Could not write stub gemini-fiddler-config.json.
 echo.
 echo Please ensure:
-echo   1. You entered a valid Gemini API key
-echo   2. The deployment directory is writable
-echo   3. You have internet access to validate the API key
+echo   1. The install directory is writable: %~dp0
+echo   2. Antivirus is not locking the folder
 echo.
-echo Get a FREE Gemini API key:
-echo   https://makersuite.google.com/app/apikey
+echo API keys are entered later in the Gemini Fiddler Client window.
 echo.
 echo ============================================================================
 pause

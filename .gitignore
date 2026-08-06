@@ -12,6 +12,9 @@ mcp_server.err.log
 *.7z
 *.zip
 
+# Built two-file distribution (run pack-release.bat locally)
+dist/
+
 # Python
 __pycache__/
 *.py[cod]

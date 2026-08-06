@@ -1,6 +1,8 @@
 # DeepSeek Second Backend and Investigate Workflow
 
-Documentation for work completed in the DeepSeek second-backend delivery thread. Covers architecture changes, analyst UX, SSL/config hardening on analysis VMs, and the `/investigate` / `/investigate <domain>` playbook.
+Documentation for DeepSeek second-backend delivery and the `/investigate` playbook.
+
+OpenRouter was later added as a third OpenAI-compatible provider (`llm_providers/openrouter_provider.py`, `/model 14`–`18`, freeform `vendor/model`). Gemini remains default. Bare DeepSeek names stay on the direct DeepSeek API; slash IDs such as `deepseek/deepseek-v4-pro` route through OpenRouter. See README and `NATIVE_TOOLS_SOAK_CHECKLIST.txt` OpenRouter section O1–O7. Restore tag: `pre-openrouter-restore`.
 
 Entry script remains `gemini-fiddler-client.py`. Gemini stays the default provider.
 

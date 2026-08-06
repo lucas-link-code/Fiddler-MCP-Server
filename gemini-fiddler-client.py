@@ -239,8 +239,10 @@ def bootstrap_runtime(auto_install: bool = True) -> bool:
 # Available models (centralized). Numbers used by /model and first-run wizard.
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_OPENROUTER_MODEL = "z-ai/glm-5.2"
 DEFAULT_PROVIDER = "gemini"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 GEMINI_MODELS = {
     "1": "gemini-3-flash-preview",
@@ -259,12 +261,22 @@ DEEPSEEK_MODELS = {
     "12": "deepseek-v4-flash",
     "13": "deepseek-v4-pro",
 }
+OPENROUTER_MODELS = {
+    "14": "z-ai/glm-5.2",
+    "15": "deepseek/deepseek-v4-flash",
+    "16": "deepseek/deepseek-v4-pro",
+    "17": "qwen/qwen3.8-max",
+    "18": "moonshotai/kimi-k3",
+}
 # Combined for backward-compatible /model number resolution
-AVAILABLE_MODELS = {**GEMINI_MODELS, **DEEPSEEK_MODELS}
+AVAILABLE_MODELS = {**GEMINI_MODELS, **DEEPSEEK_MODELS, **OPENROUTER_MODELS}
 
 
 def provider_for_model(model_name: str) -> str:
-    if model_name in DEEPSEEK_MODELS.values() or str(model_name).startswith("deepseek-"):
+    name = str(model_name or "")
+    if name in OPENROUTER_MODELS.values() or "/" in name:
+        return "openrouter"
+    if name in DEEPSEEK_MODELS.values() or (name.startswith("deepseek-") and "/" not in name):
         return "deepseek"
     return "gemini"
 
@@ -275,11 +287,14 @@ def resolve_model_identifier(model_identifier: str) -> Optional[str]:
         return AVAILABLE_MODELS[mid]
     if mid in AVAILABLE_MODELS.values():
         return mid
+    # Freeform OpenRouter vendor/model ids
+    if "/" in mid:
+        return mid
     return None
 
 
 class GeminiFiddlerClient:
-    """Fiddler MCP client with Gemini (default) or DeepSeek native tool backends."""
+    """Fiddler MCP client with Gemini (default), DeepSeek, or OpenRouter native tool backends."""
 
     def __init__(
         self,
@@ -290,15 +305,21 @@ class GeminiFiddlerClient:
         deepseek_api_key: Optional[str] = None,
         deepseek_base_url: str = DEEPSEEK_BASE_URL,
         deepseek_ssl_verify: Any = True,
+        openrouter_api_key: Optional[str] = None,
+        openrouter_base_url: str = OPENROUTER_BASE_URL,
+        openrouter_ssl_verify: Any = True,
     ):
         """Initialize client with LLM API credentials."""
         self.api_key = api_key
         self.deepseek_api_key = deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or ""
         self.deepseek_base_url = (deepseek_base_url or DEEPSEEK_BASE_URL).rstrip("/")
         self.deepseek_ssl_verify = deepseek_ssl_verify
+        self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY") or ""
+        self.openrouter_base_url = (openrouter_base_url or OPENROUTER_BASE_URL).rstrip("/")
+        self.openrouter_ssl_verify = openrouter_ssl_verify
         self.model_name = model_name
         self.provider_name = (provider or provider_for_model(model_name) or DEFAULT_PROVIDER).lower()
-        if self.provider_name not in ("gemini", "deepseek"):
+        if self.provider_name not in ("gemini", "deepseek", "openrouter"):
             self.provider_name = DEFAULT_PROVIDER
         self.mcp_process = None
         self.mcp_stderr_file = None
@@ -323,11 +344,11 @@ class GeminiFiddlerClient:
         self._current_user_query = ""
         self._mcp_server_command: Optional[List[str]] = None
         # Native function calling (default on). Set GEMINI_NATIVE_TOOLS=0 for legacy text JSON loop.
-        # DeepSeek has no legacy text loop; native tools are always required for that provider.
+        # DeepSeek/OpenRouter have no legacy text loop; native tools are always required.
         self.use_native_tools = os.environ.get("GEMINI_NATIVE_TOOLS", "1").strip().lower() not in {
             "0", "false", "no", "off",
         }
-        if self.provider_name == "deepseek":
+        if self.provider_name in ("deepseek", "openrouter"):
             self.use_native_tools = True
         self._gemini_tool = None
         self._system_instruction = ""
@@ -350,7 +371,24 @@ class GeminiFiddlerClient:
             print("[!] Tip: Install 'rich' library for better formatting: pip install rich")
 
     def _init_llm_provider(self) -> None:
-        """Create Gemini or DeepSeek provider for the configured model."""
+        """Create Gemini, DeepSeek, or OpenRouter provider for the configured model."""
+        if self.provider_name == "openrouter":
+            if not self.openrouter_api_key:
+                raise RuntimeError(
+                    "OpenRouter selected but no API key. Set openrouter_api_key in config "
+                    "or OPENROUTER_API_KEY env."
+                )
+            self.use_native_tools = True
+            from llm_providers.openrouter_provider import OpenRouterProvider
+            self.llm_provider = OpenRouterProvider(
+                api_key=self.openrouter_api_key,
+                model_name=self.model_name,
+                base_url=self.openrouter_base_url,
+                ssl_verify=getattr(self, "openrouter_ssl_verify", True),
+            )
+            self.model = None
+            return
+
         if self.provider_name == "deepseek":
             if not self.deepseek_api_key:
                 raise RuntimeError(
@@ -1375,12 +1413,12 @@ class GeminiFiddlerClient:
                 )
             else:
                 self.log_with_timestamp(
-                    "No tools bound for DeepSeek; native tools required",
+                    f"No tools bound for {self.provider_name}; native tools required",
                     to_console=True,
                     prefix="[!] ",
                 )
             self._gemini_tool = None
-            # DeepSeek requires native tools; Gemini can fall back to legacy text loop
+            # DeepSeek/OpenRouter require native tools; Gemini can fall back to legacy text loop
             if self.provider_name == "gemini":
                 self.use_native_tools = False
                 if genai is not None:
@@ -2697,15 +2735,15 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         # Add user query to history
         self.conversation_history.append({"role": "user", "content": user_query})
 
-        if self.provider_name == "deepseek":
-            # DeepSeek has no Gemini text-JSON legacy loop
+        if self.provider_name in ("deepseek", "openrouter"):
+            # OpenAI-compatible providers have no Gemini text-JSON legacy loop
             self.use_native_tools = True
             if self._gemini_tool is None or self.llm_provider is None or not self.llm_provider.tools_bound():
                 if self.available_tools:
                     self.bind_gemini_tools()
             if self.llm_provider is None or not self.llm_provider.tools_bound():
                 err = (
-                    "DeepSeek native tools are not bound. "
+                    f"{self.provider_name} native tools are not bound. "
                     "Re-run /model or restart after tools/list succeeds."
                 )
                 self.conversation_history.append({"role": "error", "content": err})
@@ -3237,16 +3275,16 @@ Do not emit any tool JSON."""
         print("  /help         - Show this menu and example queries")
         print("  /stats        - Show bridge statistics")
         print("  /tools        - List available tools")
-        print("  /model        - Show/change LLM model (Gemini or DeepSeek)")
+        print("  /model        - Show/change LLM model (Gemini, DeepSeek, or OpenRouter)")
         print("  /history      - Show conversation history")
         print("  /clear        - Clear bridge capture buffers (live + suspicious)")
         print("  /clearchat    - Clear conversation history")
         print("  /investigate  - Hunt malicious traffic in the current buffer")
         print("  /investigate <host> - Same playbook, prioritize a host")
         print("  /quit         - Exit")
-        print("\nModels: Gemini default; DeepSeek via /model deepseek-v4-flash or deepseek-v4-pro")
-        print("        Missing DeepSeek key: /model will prompt and save it to gemini-fiddler-config.json")
-        print("        /investigate and EKFiddle authoring work on both providers")
+        print("\nModels: Gemini default; DeepSeek 12-13; OpenRouter 14-18 (e.g. /model 14 or z-ai/glm-5.2)")
+        print("        Missing DeepSeek/OpenRouter keys: /model prompts and saves to gemini-fiddler-config.json")
+        print("        /investigate and EKFiddle authoring work on all providers")
 
     def show_help(self):
         """Show slash-command menu and example queries."""
@@ -3334,25 +3372,34 @@ Do not emit any tool JSON."""
         print("=" * 70)
 
     def show_models(self):
-        """Show available Gemini and DeepSeek models and current selection"""
+        """Show available Gemini, DeepSeek, and OpenRouter models and current selection"""
         print("\n" + "=" * 70)
         print("Available LLM Models")
         print("=" * 70)
         print(f"\nCurrent: provider={self.provider_name} model={self.model_name}")
         ds_status = "configured" if self.deepseek_api_key else "not set (will prompt on switch)"
+        or_status = "configured" if self.openrouter_api_key else "not set (will prompt on switch)"
         print(f"DeepSeek API key: {ds_status}")
+        print(f"OpenRouter API key: {or_status}")
         print("\nGemini:")
         for num, name in GEMINI_MODELS.items():
             marker = " <-- CURRENT" if name == self.model_name else ""
             print(f"  {num}. {name}{marker}")
-        print("\nDeepSeek:")
+        print("\nDeepSeek (direct API):")
         for num, name in DEEPSEEK_MODELS.items():
             marker = " <-- CURRENT" if name == self.model_name else ""
             print(f"  {num}. {name}{marker}")
+        print("\nOpenRouter:")
+        for num, name in OPENROUTER_MODELS.items():
+            marker = " <-- CURRENT" if name == self.model_name else ""
+            print(f"  {num}. {name}{marker}")
         print("\nTo switch: /model <number> or /model <name>")
-        print(f"Example: /model 1  or  /model {DEFAULT_DEEPSEEK_MODEL}")
+        print(f"Example: /model 1  or  /model {DEFAULT_OPENROUTER_MODEL}")
+        print("Freeform OpenRouter: /model vendor/model (any id containing /)")
         if not self.deepseek_api_key:
             print("DeepSeek models will ask for an API key and save it to gemini-fiddler-config.json")
+        if not self.openrouter_api_key:
+            print("OpenRouter models will ask for an API key and save it to gemini-fiddler-config.json")
         print("=" * 70)
 
     def prompt_and_save_deepseek_api_key(self) -> bool:
@@ -3381,13 +3428,42 @@ Do not emit any tool JSON."""
             return True
         except Exception as e:
             print(f"[X] Failed to save config: {e}")
-            # Still allow in-memory use for this session
             self.deepseek_api_key = key
             print("[!] Using key for this session only (not persisted).")
             return True
 
+    def prompt_and_save_openrouter_api_key(self) -> bool:
+        """Prompt for OpenRouter API key, save to config, and apply in-memory. Returns True if set."""
+        print("\nOpenRouter API key is required for this model.")
+        print("Get a key at: https://openrouter.ai/keys")
+        print(f"It will be saved to: {config_file_path().name}")
+        try:
+            key = input("\nPaste OpenRouter API key (or Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[!] Cancelled.")
+            return False
+        if not key:
+            print("[!] No key entered. Staying on current model.")
+            return False
+        if key.lower() in {"cancel", "q", "quit"}:
+            print("[!] Cancelled.")
+            return False
+        try:
+            path = merge_save_config({
+                "openrouter_api_key": key,
+                "openrouter_base_url": self.openrouter_base_url or OPENROUTER_BASE_URL,
+            })
+            self.openrouter_api_key = key
+            print(f"[+] OpenRouter API key saved to {path.name}")
+            return True
+        except Exception as e:
+            print(f"[X] Failed to save config: {e}")
+            self.openrouter_api_key = key
+            print("[!] Using key for this session only (not persisted).")
+            return True
+
     def change_model(self, model_identifier: str):
-        """Switch Gemini or DeepSeek model at runtime."""
+        """Switch Gemini, DeepSeek, or OpenRouter model at runtime."""
         model_identifier = model_identifier.strip()
         new_model = resolve_model_identifier(model_identifier)
         if not new_model:
@@ -3402,6 +3478,10 @@ Do not emit any tool JSON."""
 
         if new_provider == "deepseek" and not self.deepseek_api_key:
             if not self.prompt_and_save_deepseek_api_key():
+                return
+
+        if new_provider == "openrouter" and not self.openrouter_api_key:
+            if not self.prompt_and_save_openrouter_api_key():
                 return
 
         if new_provider == "gemini" and not self.api_key:
@@ -3419,7 +3499,6 @@ Do not emit any tool JSON."""
                 if not self.bind_gemini_tools():
                     if self.provider_name == "gemini" and genai is not None:
                         self.model = genai.GenerativeModel(new_model)
-            # Persist last selected model/provider when config exists or was just created
             try:
                 merge_save_config({
                     "model": self.model_name,
@@ -3484,32 +3563,54 @@ def load_config() -> Dict[str, str]:
     """Load configuration from file or environment"""
     config_file = config_file_path()
     
-    # Try to load from config file
+    # Try to load from config file (including stub with empty keys)
     if config_file.exists():
         try:
             with open(config_file) as f:
                 config = json.load(f)
-                if config.get("api_key") or config.get("deepseek_api_key"):
-                    config.setdefault("auto_save_full_bodies", False)
-                    config.setdefault("provider", provider_for_model(config.get("model", DEFAULT_GEMINI_MODEL)))
-                    return config
+            if isinstance(config, dict):
+                config.setdefault("auto_save_full_bodies", False)
+                config.setdefault("model", DEFAULT_GEMINI_MODEL)
+                config.setdefault(
+                    "provider",
+                    provider_for_model(config.get("model", DEFAULT_GEMINI_MODEL)),
+                )
+                config.setdefault("api_key", "")
+                config.setdefault("deepseek_api_key", "")
+                config.setdefault("openrouter_api_key", "")
+                # Stub or incomplete: still return so main can run the key wizard
+                return config
         except Exception:
             pass
     
     # Try environment variable
     api_key = os.getenv("GEMINI_API_KEY")
     deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
     provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).strip().lower()
-    model = os.getenv("GEMINI_MODEL") or os.getenv("DEEPSEEK_MODEL") or DEFAULT_GEMINI_MODEL
-    if provider == "deepseek" and not os.getenv("GEMINI_MODEL"):
+    model = (
+        os.getenv("GEMINI_MODEL")
+        or os.getenv("DEEPSEEK_MODEL")
+        or os.getenv("OPENROUTER_MODEL")
+        or DEFAULT_GEMINI_MODEL
+    )
+    if provider == "deepseek" and not os.getenv("GEMINI_MODEL") and not os.getenv("OPENROUTER_MODEL"):
         model = os.getenv("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
-    if api_key or deepseek_key:
+    if provider == "openrouter" and not os.getenv("GEMINI_MODEL"):
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
+    if api_key or deepseek_key or openrouter_key:
         return {
             "api_key": api_key or "",
             "deepseek_api_key": deepseek_key or "",
-            "provider": provider if provider in ("gemini", "deepseek") else provider_for_model(model),
+            "openrouter_api_key": openrouter_key or "",
+            "provider": (
+                provider
+                if provider in ("gemini", "deepseek", "openrouter")
+                else provider_for_model(model)
+            ),
             "model": model,
             "deepseek_base_url": os.getenv("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL),
+            "openrouter_base_url": os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
             "auto_save_full_bodies": os.getenv("GEMINI_AUTO_SAVE_FULL_BODIES", "false").lower() in {"1", "true", "yes", "on"},
         }
     
@@ -3532,11 +3633,15 @@ def create_config_file():
     print("   https://platform.deepseek.com/")
     deepseek_api_key = input("\nDeepSeek API Key [Enter to skip]: ").strip()
 
-    if not api_key and not deepseek_api_key:
-        print("[X] Need at least one API key (Gemini or DeepSeek). Exiting.")
+    print("\n4. Optional OpenRouter API key (for models 14-18 / vendor/model ids):")
+    print("   https://openrouter.ai/keys")
+    openrouter_api_key = input("\nOpenRouter API Key [Enter to skip]: ").strip()
+
+    if not api_key and not deepseek_api_key and not openrouter_api_key:
+        print("[X] Need at least one API key (Gemini, DeepSeek, or OpenRouter). Exiting.")
         sys.exit(1)
     
-    print("\n4. Select default model:")
+    print("\n5. Select default model:")
     print("\n   GEMINI (default provider):")
     print("   1. gemini-3-flash-preview (DEFAULT)")
     print("   2. gemini-3.1-flash-lite")
@@ -3545,9 +3650,15 @@ def create_config_file():
     print("   5. gemini-2.5-flash")
     print("   6. gemini-2.5-pro")
     print("   7. gemini-2.5-flash-lite")
-    print("\n   DEEPSEEK:")
+    print("\n   DEEPSEEK (direct API):")
     print("   12. deepseek-v4-flash")
     print("   13. deepseek-v4-pro")
+    print("\n   OPENROUTER:")
+    print("   14. z-ai/glm-5.2")
+    print("   15. deepseek/deepseek-v4-flash")
+    print("   16. deepseek/deepseek-v4-pro")
+    print("   17. qwen/qwen3.8-max")
+    print("   18. moonshotai/kimi-k3")
     print("\n   Enter number or full model name")
     
     model_choice = input(f"\nModel [1 for {DEFAULT_GEMINI_MODEL}]: ").strip() or "1"
@@ -3555,6 +3666,9 @@ def create_config_file():
     provider = provider_for_model(model)
     if provider == "deepseek" and not deepseek_api_key:
         print("[X] DeepSeek model selected but no DeepSeek API key. Exiting.")
+        sys.exit(1)
+    if provider == "openrouter" and not openrouter_api_key:
+        print("[X] OpenRouter model selected but no OpenRouter API key. Exiting.")
         sys.exit(1)
     if provider == "gemini" and not api_key:
         print("[X] Gemini model selected but no Gemini API key. Exiting.")
@@ -3572,10 +3686,13 @@ def create_config_file():
     config = {
         "api_key": api_key,
         "deepseek_api_key": deepseek_api_key,
+        "openrouter_api_key": openrouter_api_key,
         "provider": provider,
         "model": model,
         "deepseek_base_url": DEEPSEEK_BASE_URL,
         "deepseek_ssl_verify": True,
+        "openrouter_base_url": OPENROUTER_BASE_URL,
+        "openrouter_ssl_verify": True,
         "auto_save_full_bodies": auto_save_full_bodies,
         "mcp_server_command": [python_cmd, "5ire-bridge.py"],
         "bridge_url": "http://127.0.0.1:8081"
@@ -3589,7 +3706,7 @@ def create_config_file():
         return config
     except Exception as e:
         print(f"\n[X] Failed to save config: {e}")
-        print("You can set GEMINI_API_KEY / DEEPSEEK_API_KEY environment variables instead.")
+        print("You can set GEMINI_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY environment variables instead.")
         return config
 
 
@@ -3598,7 +3715,7 @@ def main():
     import platform
     import signal
 
-    print("\nFiddler Traffic Analyzer (Gemini default, DeepSeek optional)")
+    print("\nFiddler Traffic Analyzer (Gemini default; DeepSeek / OpenRouter optional)")
     print("=" * 70)
 
     # 1) Check / install Python deps and verify companion scripts
@@ -3631,21 +3748,37 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     try:
-        # Load or create configuration
+        # Load or create configuration. Stub deploy config has empty keys → wizard.
         config = load_config()
-        if not config.get("api_key") and not config.get("deepseek_api_key"):
+        has_any_key = bool(
+            (config.get("api_key") or "").strip()
+            or (config.get("deepseek_api_key") or "").strip()
+            or (config.get("openrouter_api_key") or "").strip()
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+        )
+        if not has_any_key:
+            print("\n[*] No API keys in config. Starting first-run setup...")
             config = create_config_file()
 
         model = config.get("model", DEFAULT_GEMINI_MODEL)
         provider = (config.get("provider") or provider_for_model(model) or DEFAULT_PROVIDER).lower()
-        api_key = config.get("api_key") or ""
-        deepseek_api_key = config.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY") or ""
+        api_key = (config.get("api_key") or os.getenv("GEMINI_API_KEY") or "").strip()
+        deepseek_api_key = (config.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+        openrouter_api_key = (config.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY") or "").strip()
 
         if provider == "deepseek" and not deepseek_api_key:
             print("[X] DeepSeek provider selected but deepseek_api_key / DEEPSEEK_API_KEY missing.")
+            print("[!] Re-run or use /model after adding a key.")
+            sys.exit(1)
+        if provider == "openrouter" and not openrouter_api_key:
+            print("[X] OpenRouter provider selected but openrouter_api_key / OPENROUTER_API_KEY missing.")
+            print("[!] Re-run or use /model after adding a key.")
             sys.exit(1)
         if provider == "gemini" and not api_key:
             print("[X] Gemini provider selected but api_key / GEMINI_API_KEY missing.")
+            print("[!] Re-run the client to complete first-run setup.")
             sys.exit(1)
 
         auto_save_bodies = config.get("auto_save_full_bodies", False)
@@ -3660,6 +3793,12 @@ def main():
             deepseek_ssl_verify=config.get(
                 "deepseek_ssl_verify",
                 os.getenv("DEEPSEEK_SSL_VERIFY", "1"),
+            ),
+            openrouter_api_key=openrouter_api_key,
+            openrouter_base_url=config.get("openrouter_base_url", OPENROUTER_BASE_URL),
+            openrouter_ssl_verify=config.get(
+                "openrouter_ssl_verify",
+                os.getenv("OPENROUTER_SSL_VERIFY", "1"),
             ),
         )
         if config.get("bridge_url"):

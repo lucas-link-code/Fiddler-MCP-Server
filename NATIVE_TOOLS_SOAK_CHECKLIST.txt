@@ -1,7 +1,9 @@
 Native Gemini Tool Binding - Manual Soak Checklist
 ==================================================
 
-Run after deploy with enhanced-bridge + 5ire-bridge + gemini-fiddler-client.
+Run after deploy with enhanced-bridge + gemini-fiddler-client.
+5ire-bridge is owned by the client as the MCP child; no separate console required.
+After first two-file setup, day-to-day restart: start-fiddler-mcp.bat
 Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini tools when provider=gemini.
 
 1. Triage
@@ -96,5 +98,38 @@ D7. Connection error to api.deepseek.com
     Fix: run client on a host with outbound HTTPS, or set HTTPS_PROXY if corporate proxy is required
     Note: MCP bridges on 127.0.0.1 can still work while DeepSeek cloud calls fail
 
+OpenRouter provider parity
+==========================
+
+Requires openrouter_api_key or OPENROUTER_API_KEY. Gemini remains default until /model switches.
+Base URL: https://openrouter.ai/api/v1 (OpenAI-compatible). Do not use ANTHROPIC_* env for this client.
+
+O1. Gemini default still boots
+    Start client with provider gemini; /investigate completes with tool calls
+
+O2. GLM investigate
+    /model 14 (z-ai/glm-5.2)
+    Expect: Bound N OpenRouter tools
+    /investigate completes with tool calls
+
+O3. OpenRouter DeepSeek-pro EKFiddle
+    /model 16 (deepseek/deepseek-v4-pro)
+    Ask: create EKFiddle rules for malicious code in a named session
+    Expect: tab-separated rules + generated_ekfiddle_rules.txt update
+
+O4. Direct DeepSeek still distinct
+    /model 12 still uses direct DeepSeek API (provider=deepseek), not OpenRouter
+
+O5. Freeform OpenRouter id
+    /model qwen/qwen3.8-max with key configured
+    Expect: provider=openrouter; next query uses that model
+
+O6. Mid-session switch back to Gemini
+    /model 1 without restart; /clear /clearchat still work
+
+O7. TLS on FLARE VM
+    CERTIFICATE_VERIFY_FAILED: set openrouter_ssl_verify false or OPENROUTER_SSL_VERIFY=0 (lab only)
+    Check: curl -I https://openrouter.ai/api/v1
+
 Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.
-Rollback tag if needed: pre-deepseek-restore
+Rollback tags if needed: pre-deepseek-restore or pre-openrouter-restore

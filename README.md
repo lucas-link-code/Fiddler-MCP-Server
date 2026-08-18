@@ -1,18 +1,32 @@
-# Fiddler MCP Bridge
+# Fiddler MCP Server
 
-Real-time web traffic analysis powered by Gemini (default), DeepSeek, or OpenRouter. Connect Fiddler Classic to large language models via the Model Context Protocol.
+Created a GenAI assisted workflow that helps analysts examine HTTP traffic captured in Fiddler. Analysts can ask questions in natural language about redirects, scripts, downloads, headers and suspicious behaviour instead of reviewing each web session manually.
 
-## What This Does
+Implemented an MCP bridge as the interface between Fiddler and LLM clients, with support for Gemini, DeepSeek and OpenRouter. Developed 10 analysis tools which let the model search sessions, inspect headers and bodies, compare traffic, build timelines and review EKFiddle findings.
 
-This bridge streams captured HTTP/S sessions from Fiddler to an LLM through MCP tools. Ask natural language questions about your traffic:
+Built an agentic analysis workflow which triggers tools on demand to deliver comprehensive malicious website analysis in a report. The analyst can see the raw evidence behind each answer and remains responsible for the final decision.
 
-- "Show me sessions from the last 5 minutes"
-- "Are there any suspicious downloads?"
-- "Analyze the JavaScript in session 147"
-- "Find all POST requests to api.example.com"
-- "Create EKFiddle rules for the malicious code in session 256"
+## Quick Start
 
-The LLM receives raw session data (headers, bodies, metadata, EKFiddle comments) and performs the analysis itself. No black-box threat scoring; you see what the model sees.
+Windows analysis VM with Fiddler Classic and Python 3.10 or later.
+
+1. Download these two files from the repo root into the same folder:
+   - `Fiddler-MCP-Setup.bat`
+   - `Fiddler-MCP-Bundle.zip`
+2. Double-click `Fiddler-MCP-Setup.bat`
+3. Setup extracts to `%USERPROFILE%\Fiddler_MCP`, installs dependencies, deploys `CustomRules.js`, and starts the bridge plus client
+4. API keys are not required during setup. Enter them in the client window when prompted
+5. In Fiddler: Rules > Reload Script (Ctrl+R)
+
+Day-to-day restart from the install folder:
+
+```batch
+start-fiddler-mcp.bat
+```
+
+`5ire-bridge.py` runs inside the client as the MCP child. There is no third console window.
+
+Guides: [QUICK_START_GUIDE.txt](docs/QUICK_START_GUIDE.txt), [Fiddler_MCP_Guide.pdf](docs/Fiddler_MCP_Guide.pdf)
 
 ## Architecture
 
@@ -27,100 +41,17 @@ Fiddler Classic          enhanced-bridge.py        5ire-bridge.py         gemini
      |                         |                        |   stdin/stdout MCP   |
      |                         |                        |                      |
      |                         |                        |   Native tool loop
-     |                         |                        |   (Gemini / DeepSeek / OpenRouter)
      |                         |                        |---------------------> LLM API
 ```
 
-1. **Fiddler** captures traffic and POSTs JSON via CustomRules.js
-2. **enhanced-bridge.py** buffers sessions and exposes REST on port 8081
-3. **5ire-bridge.py** exposes MCP tools that call that REST API
-4. **gemini-fiddler-client.py** binds those tools on the active provider (Gemini FunctionDeclarations or OpenAI-compatible tools for DeepSeek/OpenRouter), runs the chat loop, and executes every tool through `call_tool`
-5. **gemini_native_tools.py**, **llm_prompts.py**, **llm_tool_schema.py**, and **llm_providers/** share schema conversion and investigation prompts across backends
+1. Fiddler captures traffic and POSTs JSON via CustomRules.js
+2. enhanced-bridge.py buffers sessions and exposes REST on port 8081
+3. 5ire-bridge.py exposes MCP tools that call that REST API
+4. gemini-fiddler-client.py binds those tools on the active LLM provider, runs the chat loop, and executes every tool through `call_tool`
 
 The model never talks to Fiddler or Python directly. The client is the middleman.
 
-## Prerequisites
-
-- Windows 10/11 (analysis VM) or macOS/Linux for development
-- **Python 3.10 or later** (3.11 or 3.12 recommended)
-- Fiddler Classic (must be installed and run at least once)
-- Gemini API key (https://aistudio.google.com/apikey) for the default provider
-- Optional: DeepSeek API key (https://platform.deepseek.com/) for `/model 12`–`13`
-- Optional: OpenRouter API key (https://openrouter.ai/keys) for `/model 14`–`18` or freeform `vendor/model`
-
-**Important:** The MCP package requires Python 3.10+.
-
-## Quick Start
-
-### Two-file Windows install (recommended)
-
-1. Copy these two files into the same folder on the analysis VM:
-   - `Fiddler-MCP-Setup.bat`
-   - `Fiddler-MCP-Bundle.zip`
-2. Double-click `Fiddler-MCP-Setup.bat`
-3. It extracts to `%USERPROFILE%\Fiddler_MCP`, installs deps, deploys `CustomRules.js`, starts the bridge and client
-4. API keys are **not** required during setup. Enter them in the Gemini Fiddler Client window when prompted
-5. In Fiddler: Rules > Reload Script (Ctrl+R)
-
-Day-to-day restart from the install folder:
-
-```batch
-start-fiddler-mcp.bat
-```
-
-Maintainer rebuild of the two-file package from the repo root:
-
-```batch
-pack-release.bat
-```
-
-Output lands in `dist\Fiddler-MCP-Setup.bat` and `dist\Fiddler-MCP-Bundle.zip`.
-
-### Dev / already-extracted folder
-
-From the install or repo folder on Windows:
-
-```batch
-deploy-mcp.bat
-```
-
-Or start the client alone. On startup it:
-
-1. Checks and installs packages from `requirements-gemini.txt` if missing
-2. Verifies `enhanced-bridge.py`, `5ire-bridge.py`, `gemini_native_tools.py`, and shared LLM modules are present
-3. Starts `enhanced-bridge.py` if port 8081 is down
-4. Starts `5ire-bridge.py` as the MCP child process (stdin/stdout; no separate console)
-5. If config has empty API keys (stub from deploy), runs first-run key setup
-6. Enters interactive chat
-
-After deployment:
-1. In Fiddler, reload the script: Rules > Reload Script (Ctrl+R)
-2. Browse the web to generate traffic
-3. Ask questions in the Gemini Fiddler Client window
-
-## How the model uses tools
-
-Default mode is native function calling (`GEMINI_NATIVE_TOOLS=1`):
-
-1. Client asks MCP `tools/list` and converts each tool schema for the active provider
-2. Gemini may return `function_call` parts, or DeepSeek may return OpenAI-style `tool_calls`
-3. Client runs `call_tool`:
-   - fixes common bad tool names
-   - sanitizes args (aliases, strip leading `*`, required key checks)
-   - blocks duplicate `session_body` re-fetches in the same query
-   - optional auto body fetch after narrow host searches
-4. Result is returned as a `FunctionResponse` (Gemini) or `role=tool` message (DeepSeek)
-5. The model continues or gives the final analyst answer
-
-If the model sends wrong parameter shapes, `call_tool` repairs or rejects with a hint. The error is fed back so it can retry. Native schemas reduce invented keys; sanitizer still catches bad values.
-
-`/investigate` and EKFiddle HARD MODE authoring use shared prompts on both providers.
-
-Legacy text JSON tool calls remain available with `GEMINI_NATIVE_TOOLS=0` on Gemini only.
-
 ## MCP Tools
-
-Ten tools are exposed to the LLM:
 
 | Tool | Purpose |
 |------|---------|
@@ -135,219 +66,57 @@ Ten tools are exposed to the LLM:
 | `fiddler_mcp__ekfiddle_sessions` | List sessions already flagged by EKFiddle |
 | `fiddler_mcp__ekfiddle_threats` | High-risk EKFiddle hits for triage |
 
-Tools return raw data. The LLM performs reasoning on headers, bodies, and EKFiddle comments.
+Tools return raw data. The LLM reasons over headers, bodies, and EKFiddle comments.
 
-## Example Session
+Slash commands in the client: `/investigate`, `/investigate <host>`, `/clear`, `/clearchat`, `/model`, `/stats`, `/tools`, `/help`, `/quit`.
 
-```
-You: Show me JavaScript files from the last 10 minutes
-
-[Tool: fiddler_mcp__sessions_search]
-Found 3 sessions matching content_type=javascript, since_minutes=10
-
-You: Analyze session 175
-
-[Tool: fiddler_mcp__session_body]
-Session 175: 7.2KB JavaScript from cdn.example.com
-Contains: obfuscated variable names, eval() call, base64 encoded string
-
-The code appears to be a loader script. The eval() on line 47 executes
-decoded content from the base64 payload. This pattern is common in
-dropper scripts...
-```
-
-## File Structure
+## Repository layout
 
 ```
-fiddler-mcp/
-├── Fiddler-MCP-Setup.bat            # Outer two-file installer (with Bundle.zip)
-├── pack-release.bat                 # Maintainer: build dist/ two-file package
-├── deploy-mcp.bat                   # Inner A-to-Z setup (after extract)
-├── start-fiddler-mcp.bat            # Day-to-day restart: bridge + client
-├── install-dependencies-manual.bat  # Manual dependency installer (if deploy fails)
-├── diagnose-environment.bat         # Diagnostic tool for troubleshooting
-├── enhanced-bridge.py               # HTTP server, session buffer (port 8081)
-├── 5ire-bridge.py                   # MCP server (FastMCP over stdin/stdout; owned by client)
-├── gemini-fiddler-client.py         # Interactive LLM chat client + bootstrap
-├── gemini_native_tools.py           # Gemini FunctionDeclaration helpers
-├── llm_prompts.py                   # Shared investigate / EKFiddle system prompts
-├── llm_tool_schema.py               # Shared MCP schema normalizer + OpenAI tools
-├── llm_providers/                   # Gemini + DeepSeek + OpenRouter native tool providers
-├── CustomRules.js                   # Fiddler script (auto-deployed)
-├── requirements-gemini.txt          # LLM client deps (google-generativeai + openai)
-├── requirements-mcp.txt             # MCP bridge dependencies
-├── gemini-fiddler-config.json       # Generated config (API keys, provider, model)
-├── NATIVE_TOOLS_SOAK_CHECKLIST.txt  # Manual validation (Gemini + DeepSeek)
-├── TROUBLESHOOTING.txt              # Detailed troubleshooting guide
-├── MCP_Data_Flow.md                 # Data flow walkthrough
-├── MCP_Server_Guide.md              # Architecture overview
-└── MCP_TOOL_CONTRACT.md             # Tool schemas and responses
+├── Fiddler-MCP-Setup.bat        # Outer installer (place next to the zip)
+├── Fiddler-MCP-Bundle.zip       # Runtime package
+├── pack-release.bat             # Rebuild the zip from package/
+├── package/                     # Files inside the zip, plus tests
+└── docs/                        # Operator guides and PDFs
 ```
 
-## Manual Setup
+Source for a rebuild lives in `package/`. Maintainer: run `pack-release.bat` from the repo root.
 
-If the one-click script fails, install manually:
+## Documentation
 
-```batch
-:: Install dependencies
-pip install -r requirements-gemini.txt
+- [QUICK_START_GUIDE.txt](docs/QUICK_START_GUIDE.txt)
+- [MCP_Data_Flow.md](docs/MCP_Data_Flow.md) / [MCP_data_flow.pdf](docs/MCP_data_flow.pdf)
+- [MCP_Server_Guide.md](docs/MCP_Server_Guide.md)
+- [Fiddler_MCP_Guide.pdf](docs/Fiddler_MCP_Guide.pdf)
+- [TROUBLESHOOTING.txt](docs/TROUBLESHOOTING.txt)
+- [EKFIDDLE_WORKFLOW_GUIDE.md](docs/EKFIDDLE_WORKFLOW_GUIDE.md)
+- [EKFIDDLE_QUICK_REFERENCE.txt](docs/EKFIDDLE_QUICK_REFERENCE.txt)
 
-:: Copy CustomRules.js to Fiddler
-copy CustomRules.js "%USERPROFILE%\Documents\Fiddler2\Scripts\"
+## LLM providers
 
-:: Start the client (auto-starts bridges if needed)
-python gemini-fiddler-client.py
-```
+Gemini is the default. DeepSeek and OpenRouter are optional. Switching providers uses `/model` in the client. A missing key is prompted once and saved locally in `gemini-fiddler-config.json`, which is not in this repository.
 
-The client prompts for your API key on first run.
+OpenRouter accepts a freeform `vendor/model` id when an OpenRouter key is present. Curated `/model` numbers for OpenRouter are 14 to 18. Direct DeepSeek API remains `/model 12` and `/model 13`.
 
-Environment flags:
-- `GEMINI_NATIVE_TOOLS=0` — legacy text JSON tool loop
-- `GEMINI_SKIP_DEP_INSTALL=1` — skip automatic pip install
-- `GEMINI_MAX_TOOL_CALLS` — max tool calls per query (default 20)
+## Prerequisites
 
-Interactive slash commands:
-- `/clear` — clear enhanced-bridge live + suspicious capture buffers (use between cases)
-- `/clearchat` — clear conversation history only
-- `/investigate` — run the malicious-traffic playbook on the current buffer
-- `/investigate <host>` — same playbook, prioritize a host first
-- `/stats` `/tools` `/history` `/model` `/help` `/quit`
-
-During a tool chain the client prints brief breadcrumbs such as `-> session_body 250` or `-> search evil.example`. Ctrl+C stops the current chain only.
-
-## Configuration
-
-`gemini-fiddler-config.json` (created by deploy-mcp.bat or first client run):
-
-```json
-{
-  "api_key": "your-gemini-api-key",
-  "deepseek_api_key": "",
-  "openrouter_api_key": "",
-  "provider": "gemini",
-  "model": "gemini-3-flash-preview",
-  "deepseek_base_url": "https://api.deepseek.com",
-  "openrouter_base_url": "https://openrouter.ai/api/v1",
-  "deepseek_ssl_verify": true,
-  "openrouter_ssl_verify": true,
-  "auto_save_full_bodies": false,
-  "mcp_server_command": ["python", "5ire-bridge.py"],
-  "bridge_url": "http://127.0.0.1:8081"
-}
-```
-
-Env overrides: `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `LLM_PROVIDER`, `GEMINI_MODEL`, `DEEPSEEK_MODEL`, `OPENROUTER_MODEL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL`.
-
-Available models:
-- Gemini (default provider): `gemini-3-flash-preview` (default), `gemini-3.1-flash-lite`, `gemini-3.1-pro-preview`, `gemini-3.5-flash`, Gemini 2.5 family
-- DeepSeek direct API: `deepseek-v4-flash`, `deepseek-v4-pro` via `/model 12` or `/model 13`
-- OpenRouter: `/model 14`–`18` curated (`z-ai/glm-5.2`, `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `qwen/qwen3.8-max`, `moonshotai/kimi-k3`) or freeform `/model vendor/model`
-
-Bare DeepSeek names (`deepseek-v4-pro`) use the direct DeepSeek API. Slash IDs (`deepseek/deepseek-v4-pro`) use OpenRouter.
-
-Switching to DeepSeek or OpenRouter via `/model` prompts for an API key if missing, saves it into `gemini-fiddler-config.json`, then completes the switch. Switching back to a Gemini id restores the Gemini provider without restart.
+- Windows 10/11 analysis VM, or macOS/Linux for development
+- Python 3.10 or later
+- Fiddler Classic, run at least once so Scripts exists
+- At least one LLM API key when the client starts: Gemini, DeepSeek, or OpenRouter
 
 ## Troubleshooting
 
-**Dependency installation failed**
+If dependency install fails, run `package/install-dependencies-manual.bat` then `package/deploy-mcp.bat`.
 
-Quick fix: Run the manual installer
-```batch
-install-dependencies-manual.bat
-```
+See [TROUBLESHOOTING.txt](docs/TROUBLESHOOTING.txt). Common issues: Fiddler must be closed when CustomRules.js is copied; port 8081 must be free; Rules > Reload Script after deploy.
 
-This installs each package individually. After completion, run deploy-mcp.bat again.
+## Use cases
 
-For diagnosis, run:
-```batch
-diagnose-environment.bat
-```
-
-This tests Python installation, pip availability, network connectivity to PyPI, package installation permissions, and antivirus interference.
-
-See TROUBLESHOOTING.txt for detailed solutions.
-
-**Port 8081 already in use**
-```batch
-netstat -ano | findstr :8081
-taskkill /F /PID <pid>
-```
-
-**CustomRules.js not deploying**
-- Close Fiddler before running deploy-mcp.bat
-- Run as Administrator if permission denied
-- Manually copy to `%USERPROFILE%\Documents\Fiddler2\Scripts\`
-
-**No sessions appearing**
-- Verify Fiddler is capturing traffic (check session list in Fiddler)
-- Reload script in Fiddler: Rules > Reload Script
-- Check bridge console for POST /live-session messages
-
-**Bridge not responding**
-```batch
-curl http://127.0.0.1:8081/health
-curl http://127.0.0.1:8081/api/stats
-```
-
-**Missing gemini_native_tools.py / llm_prompts.py**
-Keep `gemini_native_tools.py`, `llm_prompts.py`, `llm_tool_schema.py`, and `llm_providers/` in the same folder as `gemini-fiddler-client.py`. Native tool binding imports them at startup.
-
-**DeepSeek TLS / Connection error**
-Official base URL is `https://api.deepseek.com` (correct). `CERTIFICATE_VERIFY_FAILED` means the Windows Python trust store cannot validate the cert (common on analysis VMs and behind SSL-inspecting proxies).
-
-```batch
-pip install -U certifi httpx openai
-set DEEPSEEK_SSL_CERT_FILE=C:\path\to\corp-root-ca.pem
-python gemini-fiddler-client.py
-```
-
-Lab-only bypass (insecure):
-
-```batch
-set DEEPSEEK_SSL_VERIFY=0
-python gemini-fiddler-client.py
-```
-
-**OpenRouter TLS / Connection error**
-Official OpenAI-compatible base URL is `https://openrouter.ai/api/v1`. Same Python CA issues as DeepSeek on FLARE VMs.
-
-```batch
-pip install -U certifi httpx openai
-set OPENROUTER_SSL_VERIFY=0
-python gemini-fiddler-client.py
-```
-
-Or set `"openrouter_ssl_verify": false` in `gemini-fiddler-config.json`.
-
-**Enable debug mode**
-```batch
-SET DEPLOY_DEBUG=1
-deploy-mcp.bat
-```
-
-## How It Works
-
-For every captured session:
-
-1. Fiddler intercepts a request/response pair
-2. CustomRules.js serializes the session to JSON and POSTs to `http://127.0.0.1:8081/live-session`
-3. enhanced-bridge.py stores the session in a ring buffer
-4. When the analyst asks a question, Gemini may emit a `function_call` for an MCP tool
-5. gemini-fiddler-client.py executes that call through `call_tool` → 5ire-bridge → REST
-6. The tool result is returned as a `FunctionResponse`; Gemini continues or answers
-
-See `MCP_Data_Flow.md` for a detailed walkthrough with code snippets.
-See `NATIVE_TOOLS_SOAK_CHECKLIST.txt` for post-deploy validation.
-
-## Use Cases
-
-- Malware traffic analysis (FakeUpdates, SocGholish, exploit kits, EtherHiding)
+- Malware traffic analysis
 - EKFiddle CustomRegex drafting from live session bodies
-- API debugging and inspection
 - Session forensics and timeline reconstruction
-- JavaScript deobfuscation assistance
-- Header and cookie analysis
-- Redirect chain investigation
+- JavaScript and redirect-chain review
 
 ## Acknowledgments
 

@@ -1,0 +1,135 @@
+Native Gemini Tool Binding - Manual Soak Checklist
+==================================================
+
+Run after deploy with enhanced-bridge + gemini-fiddler-client.
+5ire-bridge is owned by the client as the MCP child; no separate console required.
+After first two-file setup, day-to-day restart: start-fiddler-mcp.bat
+Confirm GEMINI_NATIVE_TOOLS is on (default). Startup should print Bound N Gemini tools when provider=gemini.
+
+1. Triage
+   Ask: show high ekfiddle threats from the last hour
+   Expect: fiddler_mcp__ekfiddle_threats or ekfiddle_sessions, not invented hosts
+
+2. Host hunt
+   Ask: search sessions for host X from capture
+   Expect: fiddler_mcp__sessions_search with host_pattern, optional auto body fetch
+
+3. Body once
+   Ask: create ekfiddle rules for malicious code in session N
+   Expect: one session_body fetch max, tab-separated SourceCode/URI rules, STOP
+   Expect: High:/Med:/Low: only (not Medium:), title-case rule names
+   Expect: compound high-signal regexes, not bare eth_call or _\\w{7,8}\\(\\)
+   Expect: The crucial pattern or The key pattern explanations
+   Expect: no NitroPack / ___mnag rules unless asked
+   Expect: generated_ekfiddle_rules.txt updated
+
+4. Refetch lock
+   In the same query, model should not re-pull the same session_body
+   Client returns already analyzed this query if it tries
+   Explicit re-fetch ask should unlock bodies
+   Auto-fetch must not re-pull already-analyzed session IDs
+
+5. Zero-hit
+   Paste a list of IOC hosts where most are absent from the buffer
+   Expect: at most 1 to 2 host searches after first zero-hit, then report missing hosts
+   Expect: continue from landing session bodies or prior findings, not serial burn of all IOCs
+
+6. Compare
+   Ask: compare sessions A and B (or 3+ IDs)
+   Expect: fiddler_mcp__compare_sessions succeeds
+   Expect: no RepeatedComposite JSON serialization error in mcp_server.err.log
+
+7. Budget / interrupt / MCP survival
+   Ctrl+C mid-chain keeps the client alive and prints INTERRUPTED
+   Expect: MCP child survives when possible (new process group / new session)
+   Expect: if MCP did die, next query or call_tool prints restart and recovers
+   Hitting GEMINI_MAX_TOOL_CALLS forces text synthesis with tools disabled
+
+8. Infection chain from prior evidence
+   After bodies were already analyzed, ask for the infection chain
+   Expect: staged explanation from prior findings without requiring live MCP if tools fail
+
+9. Slash commands between cases
+   /clear clears live + suspicious bridge buffers and prints counts
+   /clearchat clears conversation history only
+   /investigate runs the malicious-traffic playbook
+   /investigate example.com prioritizes that host
+   Expect brief "  -> session_body N" / "  -> search host" lines during the chain
+
+10. Benign / FP
+    On a clean capture, expect Benign verdict without Low FP CustomRegexes auto-saved
+    Media session_body requests should be skipped with a media hint
+
+11. Legacy fallback
+    Optional: GEMINI_NATIVE_TOOLS=0 still runs the old text JSON loop on Gemini
+
+DeepSeek provider parity
+========================
+
+Requires deepseek_api_key or DEEPSEEK_API_KEY. Gemini remains default until /model switches.
+
+D1. Gemini default still boots
+    Start client with provider gemini; /investigate completes with tool calls
+
+D2. Flash investigate
+    /model deepseek-v4-flash (or /model 12)
+    Expect: Bound N DeepSeek tools
+    /investigate completes with tool calls (ekfiddle_threats / session_body etc.)
+
+D3. Pro EKFiddle authoring
+    /model deepseek-v4-pro (or /model 13)
+    Ask: create EKFiddle rules for malicious code in a named session
+    Expect: tab-separated rules + generated_ekfiddle_rules.txt update
+
+D4. Refetch / zero-hit / slash under DeepSeek
+    Confirm refetch lock, zero-hit budget, /clear, /clearchat still work
+
+D5. Mid-session switch back to Gemini
+    /model gemini-3-flash-preview (or /model 1) without restart
+    Expect: Bound N Gemini tools; next query uses Gemini
+
+D6. Missing DeepSeek key
+    Without deepseek_api_key, /model deepseek-v4-flash prompts for the key and saves it
+
+D7. Connection error to api.deepseek.com
+    Symptom: Error processing query (native tools): Connection error / DeepSeek API error
+    Cause: analysis VM cannot reach https://api.deepseek.com (no internet, firewall, or proxy)
+    Check: curl -I https://api.deepseek.com
+    Fix: run client on a host with outbound HTTPS, or set HTTPS_PROXY if corporate proxy is required
+    Note: MCP bridges on 127.0.0.1 can still work while DeepSeek cloud calls fail
+
+OpenRouter provider parity
+==========================
+
+Requires openrouter_api_key or OPENROUTER_API_KEY. Gemini remains default until /model switches.
+Base URL: https://openrouter.ai/api/v1 (OpenAI-compatible). Do not use ANTHROPIC_* env for this client.
+
+O1. Gemini default still boots
+    Start client with provider gemini; /investigate completes with tool calls
+
+O2. GLM investigate
+    /model 14 (z-ai/glm-5.2)
+    Expect: Bound N OpenRouter tools
+    /investigate completes with tool calls
+
+O3. OpenRouter DeepSeek-pro EKFiddle
+    /model 16 (deepseek/deepseek-v4-pro)
+    Ask: create EKFiddle rules for malicious code in a named session
+    Expect: tab-separated rules + generated_ekfiddle_rules.txt update
+
+O4. Direct DeepSeek still distinct
+    /model 12 still uses direct DeepSeek API (provider=deepseek), not OpenRouter
+
+O5. Freeform OpenRouter id
+    /model qwen/qwen3.8-max with key configured
+    Expect: provider=openrouter; next query uses that model
+
+O6. Mid-session switch back to Gemini
+    /model 1 without restart; /clear /clearchat still work
+
+O7. TLS on FLARE VM
+    CERTIFICATE_VERIFY_FAILED: set openrouter_ssl_verify false or OPENROUTER_SSL_VERIFY=0 (lab only)
+    Check: curl -I https://openrouter.ai/api/v1
+
+Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.
+Rollback tags if needed: pre-deepseek-restore or pre-openrouter-restore

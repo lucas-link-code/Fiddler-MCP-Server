@@ -1,0 +1,93 @@
+FIDDLER MCP SOLUTION - QUICK START GUIDE
+
+Natural language analysis of Fiddler traffic via Gemini, DeepSeek, or OpenRouter.
+
+
+PREREQUISITES
+
+1. Windows with Fiddler Classic installed and run at least once
+2. Python 3.10 or later on PATH
+3. At least one LLM API key when the client starts:
+   Gemini: https://aistudio.google.com/apikey
+   DeepSeek: https://platform.deepseek.com/
+   OpenRouter: https://openrouter.ai/keys
+4. EKFiddle in Fiddler recommended for threat triage
+
+
+TWO-FILE INSTALL (RECOMMENDED)
+
+You receive exactly two files:
+
+  Fiddler-MCP-Setup.bat
+  Fiddler-MCP-Bundle.zip
+
+Put them in the same folder. Double-click Fiddler-MCP-Setup.bat.
+
+What it does:
+
+  Extracts into %USERPROFILE%\Fiddler_MCP
+  Checks Python 3.10+
+  Finds Fiddler Scripts and deploys CustomRules.js
+  Installs packages from requirements-gemini.txt
+  Writes a stub gemini-fiddler-config.json with empty API keys
+  Starts enhanced-bridge.py on port 8081
+  Starts gemini-fiddler-client.py
+
+5ire-bridge.py is started by the client as the MCP child over stdin/stdout.
+There is no separate 5ire console window. That is expected.
+
+
+AFTER SETUP
+
+1. In Fiddler: Rules > Reload Script (Ctrl+R)
+2. Switch to the Gemini Fiddler Client window
+3. Enter at least one API key when prompted; it is saved to gemini-fiddler-config.json
+4. Browse the web to generate traffic
+5. Ask natural language questions or use /investigate
+
+
+DAY-TO-DAY RESTART
+
+From %USERPROFILE%\Fiddler_MCP run:
+
+  start-fiddler-mcp.bat
+
+This starts the bridge and client only. It does not reinstall CustomRules.
+
+
+ALREADY EXTRACTED / DEV FOLDER
+
+From the install or repo folder:
+
+  deploy-mcp.bat
+
+Same A-to-Z flow without the outer unzip step.
+
+
+PROVIDER SWITCHES AFTER FIRST KEY
+
+  /model 1 through 11   Gemini
+  /model 12 or 13       Direct DeepSeek API
+  /model 14 through 18  OpenRouter curated models
+  /model vendor/model   OpenRouter freeform id
+
+Missing DeepSeek or OpenRouter keys are prompted on switch and saved.
+
+
+EXAMPLE QUERIES
+
+  Show me sessions from the last 5 minutes
+  Which sessions were flagged by EKFiddle as suspicious?
+  Analyze the JavaScript in session 142
+  /investigate evil.example
+
+
+TROUBLESHOOTING
+
+  Dependency install fails: run install-dependencies-manual.bat then deploy-mcp.bat again
+  Environment diagnosis: diagnose-environment.bat
+  Bridge not healthy: check port 8081, close duplicate bridge windows
+  CustomRules copy fails: close Fiddler, re-run deploy-mcp.bat
+  TLS errors on DeepSeek or OpenRouter: see README lab SSL bypass notes
+
+See TROUBLESHOOTING.txt and README.md for more detail.

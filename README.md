@@ -109,7 +109,7 @@ OpenRouter accepts a freeform `vendor/model` id when an OpenRouter key is presen
 
 If dependency install fails, run `package/install-dependencies-manual.bat` then `package/deploy-mcp.bat`.
 
-On FLARE VMs, pip often fails with `CERTIFICATE_VERIFY_FAILED` talking to pypi.org even when curl/ping work. That is Python's CA store. The package includes `pypi_tls.py`; setup bats probe PyPI and retry pip with `--trusted-host`. Force lab mode with `set FIDDLER_PIP_TRUSTED_HOST=1`.
+On FLARE VMs, pip often fails with `CERTIFICATE_VERIFY_FAILED` talking to pypi.org even when curl/ping work. pip uses its own CA bundle; Windows urllib can still succeed. `pypi_tls.py` probes pip's stack and retries with `--trusted-host` on cert failure. Force lab mode with `set FIDDLER_PIP_TRUSTED_HOST=1`.
 
 See [TROUBLESHOOTING.txt](docs/TROUBLESHOOTING.txt). Common issues: Fiddler must be closed when CustomRules.js is copied; port 8081 must be free; Rules > Reload Script after deploy.
 

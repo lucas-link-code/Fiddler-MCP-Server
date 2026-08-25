@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """PyPI TLS probe and pip wrapper for FLARE / broken Python CA stores.
 
-Normal machines keep strict SSL. If a short HTTPS probe to pypi.org fails
-with a certificate error, pip is retried with --trusted-host (pip-only).
+Normal machines keep strict SSL. Probe pip's own cert stack first; urllib on
+Windows can pass via the OS store while pip's certifi still fails. If a probe
+or a pip run hits a certificate error, retry with --trusted-host (pip-only).
 Does not set PYTHONHTTPSVERIFY.
 """
 from __future__ import annotations
@@ -11,7 +12,7 @@ import os
 import ssl
 import subprocess
 import sys
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 from urllib.request import Request, urlopen
 
 PROBE_URL = "https://pypi.org/simple/pip/"
@@ -23,7 +24,23 @@ TRUSTED_HOSTS = (
 )
 
 _ENV_TRUE = {"1", "true", "yes", "on"}
+_SSL_NEEDLES = (
+    "certificate_verify_failed",
+    "certificate verify failed",
+    "sslcertverificationerror",
+    "ssl: certificate",
+    "unable to get local issuer certificate",
+)
 _cached_use_trusted: Optional[bool] = None
+_LAB_WARN = (
+    "[!] PyPI TLS verify failed or FIDDLER_PIP_TRUSTED_HOST=1. "
+    "Retrying pip with --trusted-host (lab only; pip TLS off for PyPI)."
+)
+_PIP_SSL_WARN = (
+    "[!] pip reported a certificate verify failure. "
+    "Windows urllib can pass while pip certifi fails. "
+    "Retrying pip with --trusted-host."
+)
 
 
 def _env_flag(name: str) -> bool:
@@ -37,25 +54,23 @@ def trusted_host_args() -> List[str]:
     return args
 
 
+def ssl_in_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(n in lowered for n in _SSL_NEEDLES)
+
+
 def _is_ssl_failure(exc: BaseException) -> bool:
     if isinstance(exc, ssl.SSLError):
         return True
     reason = getattr(exc, "reason", None)
     if isinstance(reason, ssl.SSLError):
         return True
-    text = str(exc).lower()
-    needles = (
-        "certificate_verify_failed",
-        "certificate verify failed",
-        "sslcertverificationerror",
-        "ssl: certificate",
-        "unable to get local issuer certificate",
-    )
-    return any(n in text for n in needles)
+    chain = [exc, reason, getattr(exc, "__cause__", None)]
+    return any(x is not None and ssl_in_text(str(x)) for x in chain)
 
 
-def probe_pypi_tls(timeout: float = PROBE_TIMEOUT) -> str:
-    """Return 'ok', 'ssl', or 'other'."""
+def probe_urllib_tls(timeout: float = PROBE_TIMEOUT) -> str:
+    """Return 'ok', 'ssl', or 'other' using stdlib urlopen (Windows CA store)."""
     req = Request(PROBE_URL, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
@@ -66,6 +81,42 @@ def probe_pypi_tls(timeout: float = PROBE_TIMEOUT) -> str:
         if any(x is not None and _is_ssl_failure(x) for x in chain):
             return "ssl"
         return "other"
+
+
+def probe_pip_stack_tls(timeout: float = PROBE_TIMEOUT) -> str:
+    """Return 'ok', 'ssl', or 'other' using pip's vendored requests/certifi."""
+    try:
+        from pip._vendor import requests as pip_requests
+    except Exception:
+        return "other"
+    try:
+        resp = pip_requests.get(PROBE_URL, timeout=timeout)
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return "ok"
+    except Exception as exc:
+        if _is_ssl_failure(exc):
+            return "ssl"
+        return "other"
+
+
+def probe_layers(timeout: float = PROBE_TIMEOUT) -> Tuple[str, str, str]:
+    """Combined result, pip_stack result, urllib result."""
+    pip_r = probe_pip_stack_tls(timeout)
+    if pip_r in ("ssl", "ok"):
+        return pip_r, pip_r, "skipped"
+    url_r = probe_urllib_tls(timeout)
+    if url_r == "ssl":
+        return "ssl", pip_r, url_r
+    return "other", pip_r, url_r
+
+
+def probe_pypi_tls(timeout: float = PROBE_TIMEOUT) -> str:
+    """Return 'ok', 'ssl', or 'other'. Prefers pip's TLS stack over urllib."""
+    combined, _, _ = probe_layers(timeout)
+    return combined
 
 
 def use_trusted_host(force_probe: bool = False) -> bool:
@@ -98,16 +149,47 @@ def build_pip_command(pip_args: Sequence[str], use_trusted: Optional[bool] = Non
     return cmd
 
 
+def _invoke_pip(cmd: List[str], cwd: Optional[str], capture: bool) -> subprocess.CompletedProcess:
+    if not capture:
+        return subprocess.run(cmd, cwd=cwd)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    chunks: List[str] = []
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            chunks.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    rc = proc.wait()
+    return subprocess.CompletedProcess(cmd, int(rc), stdout="".join(chunks), stderr="")
+
+
 def run_pip(pip_args: Sequence[str], cwd: Optional[str] = None) -> int:
+    global _cached_use_trusted
     trusted = use_trusted_host()
     if trusted:
-        print(
-            "[!] PyPI TLS verify failed or FIDDLER_PIP_TRUSTED_HOST=1. "
-            "Retrying pip with --trusted-host (lab only; pip TLS off for PyPI)."
-        )
-    cmd = build_pip_command(pip_args, use_trusted=trusted)
-    result = subprocess.run(cmd, cwd=cwd)
-    return int(result.returncode)
+        print(_LAB_WARN)
+        result = _invoke_pip(build_pip_command(pip_args, use_trusted=True), cwd, capture=False)
+        return int(result.returncode)
+
+    first = _invoke_pip(build_pip_command(pip_args, use_trusted=False), cwd, capture=True)
+    if _env_flag("FIDDLER_PIP_STRICT_SSL"):
+        return int(first.returncode)
+    if not ssl_in_text(first.stdout or ""):
+        return int(first.returncode)
+
+    print(_PIP_SSL_WARN)
+    _cached_use_trusted = True
+    second = _invoke_pip(build_pip_command(pip_args, use_trusted=True), cwd, capture=False)
+    return int(second.returncode)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -123,11 +205,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     cmd = args[0]
     if cmd == "probe":
-        result = probe_pypi_tls()
-        print(f"pypi_tls probe: {result}")
-        if result == "ok":
+        combined, pip_r, url_r = probe_layers()
+        print(f"pypi_tls probe: {combined}")
+        print(f"pypi_tls detail: pip_stack={pip_r} urllib={url_r}")
+        if combined == "ok":
             return 0
-        if result == "ssl":
+        if combined == "ssl":
             return 2
         return 1
     if cmd == "install":

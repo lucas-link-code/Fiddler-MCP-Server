@@ -114,8 +114,11 @@ Error: "SSL: CERTIFICATE_VERIFY_FAILED" during pip
 This is Python's CA store, not missing internet. ping/curl to pypi.org can succeed
 while pip still fails. Common on FLARE analysis VMs with Python 3.10.
 
-Setup scripts now probe PyPI via pypi_tls.py and retry pip with --trusted-host
-when TLS verify fails. Keep pypi_tls.py next to the .bat files.
+Setup scripts probe pip's own TLS stack via pypi_tls.py, then retry pip with
+--trusted-host when verify fails. urllib on Windows can pass because it uses
+the OS store while pip uses certifi, so a raw urlopen probe is not enough.
+Keep pypi_tls.py next to the .bat files. If pip still prints
+CERTIFICATE_VERIFY_FAILED, the helper retries once with --trusted-host.
 
 Manual equivalent:
    python pypi_tls.py install --upgrade pip

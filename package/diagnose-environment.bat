@@ -101,7 +101,12 @@ REM Test 4: pip Upgrade
 echo [TEST 4] pip Upgrade Test
 echo ----------------------------------------
 echo Attempting to upgrade pip...
-python -m pip install --upgrade pip
+if exist "%~dp0pypi_tls.py" (
+    python "%~dp0pypi_tls.py" install --upgrade pip
+) else (
+    echo FAILED: pypi_tls.py missing next to this script
+    echo Keep pypi_tls.py in the same folder as diagnose-environment.bat
+)
 if errorlevel 1 (
     echo FAILED: Cannot upgrade pip
     echo ERROR CODE: %ERRORLEVEL%
@@ -110,9 +115,10 @@ if errorlevel 1 (
     echo   - No internet connection
     echo   - Corporate firewall blocking PyPI
     echo   - Insufficient permissions
+    echo   - Python TLS/CA failure talking to pypi.org
     echo.
 ) else (
-    echo SUCCESS: pip upgraded successfully
+    echo SUCCESS: pip upgrade command finished
 )
 echo.
 
@@ -146,22 +152,32 @@ echo.
 REM Test 6: PyPI Package Index Access
 echo [TEST 6] PyPI Package Index Access
 echo ----------------------------------------
-echo Attempting to query PyPI...
-python -m pip index versions pip --disable-pip-version-check >nul 2>&1
-if errorlevel 1 (
-    echo FAILED: Cannot access PyPI package index
-    echo.
-    echo This indicates:
-    echo   - Corporate proxy blocking PyPI
-    echo   - Firewall restrictions
-    echo   - SSL/TLS certificate issues
-    echo.
-    echo If behind corporate proxy, configure:
-    echo   set HTTP_PROXY=http://your-proxy:port
-    echo   set HTTPS_PROXY=http://your-proxy:port
-    echo.
+echo Probing HTTPS to pypi.org with Python TLS...
+if exist "%~dp0pypi_tls.py" (
+    python "%~dp0pypi_tls.py" probe
+    set PROBE_RC=!ERRORLEVEL!
+    if !PROBE_RC! EQU 0 (
+        echo SUCCESS: Python TLS to PyPI works
+    ) else if !PROBE_RC! EQU 2 (
+        echo FAILED: Python TLS certificate verify failed talking to pypi.org
+        echo.
+        echo This is the FLARE / Python CA-store issue, not missing internet.
+        echo curl or ping may still work. pip uses Python certs.
+        echo Setup scripts retry pip with --trusted-host via pypi_tls.py
+        echo.
+        echo Force lab mode: set FIDDLER_PIP_TRUSTED_HOST=1
+        echo.
+    ) else (
+        echo FAILED: Cannot reach PyPI ^(network, DNS, or proxy^)
+        echo.
+        echo If behind corporate proxy, configure:
+        echo   set HTTP_PROXY=http://your-proxy:port
+        echo   set HTTPS_PROXY=http://your-proxy:port
+        echo.
+    )
 ) else (
-    echo SUCCESS: PyPI package index accessible
+    echo FAILED: pypi_tls.py missing; cannot classify SSL vs block
+    echo Keep pypi_tls.py next to diagnose-environment.bat
 )
 echo.
 
@@ -169,7 +185,11 @@ REM Test 7: Test Package Installation
 echo [TEST 7] Test Package Installation
 echo ----------------------------------------
 echo Installing test package: requests
-python -m pip install requests --disable-pip-version-check
+if exist "%~dp0pypi_tls.py" (
+    python "%~dp0pypi_tls.py" install requests --disable-pip-version-check
+) else (
+    echo FAILED: pypi_tls.py missing next to this script
+)
 if errorlevel 1 (
     echo FAILED: Cannot install test package
     echo ERROR CODE: %ERRORLEVEL%
@@ -269,13 +289,12 @@ echo.
 echo MANUAL INSTALLATION FALLBACK:
 echo   If automatic installation keeps failing, install packages manually:
 echo.
-echo   python -m pip install --upgrade pip
-echo   python -m pip install google-generativeai
-echo   python -m pip install rich
-echo   python -m pip install mcp
-echo   python -m pip install pydantic
-echo   python -m pip install Flask
-echo   python -m pip install requests
+echo   python pypi_tls.py install --upgrade pip
+echo   python pypi_tls.py install -r requirements-gemini.txt
+echo.
+echo   Lab-only if probe reports SSL failure:
+echo   set FIDDLER_PIP_TRUSTED_HOST=1
+echo   python pypi_tls.py install -r requirements-gemini.txt
 echo.
 echo   Then run deploy-mcp.bat again
 echo.

@@ -19,6 +19,9 @@ echo OpenRouter, MCP bridges, and the Flask session buffer.
 echo.
 echo Prefer running as Administrator if pip fails with permission errors.
 echo.
+echo On FLARE / analysis VMs, Python may fail TLS to pypi.org. This installer
+echo probes PyPI and retries pip with --trusted-host when needed.
+echo.
 echo ============================================================================
 echo.
 pause
@@ -50,19 +53,26 @@ pause
 exit /b 1
 
 :AFTER_PY_CHECK
+if not exist "%~dp0pypi_tls.py" (
+    echo ERROR: pypi_tls.py not found next to this script.
+    echo Keep pypi_tls.py in the same folder as install-dependencies-manual.bat
+    pause
+    exit /b 1
+)
+
 echo [Step 2/4] Upgrading pip...
-python -m pip install --upgrade pip
+python "%~dp0pypi_tls.py" install --upgrade pip
 if errorlevel 1 (
-    echo WARNING: pip upgrade failed, continuing...
+    echo WARNING: pip upgrade failed, continuing with current pip...
 ) else (
-    echo SUCCESS: pip upgraded
+    echo SUCCESS: pip upgrade command finished
 )
 echo.
 
 echo [Step 3/4] Installing packages...
 if exist "%~dp0requirements-gemini.txt" (
     echo Using requirements-gemini.txt
-    python -m pip install -r "%~dp0requirements-gemini.txt"
+    python "%~dp0pypi_tls.py" install -r "%~dp0requirements-gemini.txt"
     if errorlevel 1 (
         echo ERROR: requirements-gemini.txt install failed
         echo Falling back to per-package installs...
@@ -85,7 +95,7 @@ for %%P in (
     requests
 ) do (
     echo   Installing %%P...
-    python -m pip install %%P
+    python "%~dp0pypi_tls.py" install %%P
     if errorlevel 1 (
         echo ERROR: Failed to install %%P
         pause

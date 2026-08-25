@@ -110,10 +110,27 @@ Solution: Check internet connection and PyPI access
 Error: "Permission denied"
 Solution: Run Command Prompt as Administrator
 
-Error: "SSL: CERTIFICATE_VERIFY_FAILED"
-Solution: Corporate firewall issue
-   - Contact IT department for proxy settings
-   - Or use: pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org
+Error: "SSL: CERTIFICATE_VERIFY_FAILED" during pip
+This is Python's CA store, not missing internet. ping/curl to pypi.org can succeed
+while pip still fails. Common on FLARE analysis VMs with Python 3.10.
+
+Setup scripts now probe PyPI via pypi_tls.py and retry pip with --trusted-host
+when TLS verify fails. Keep pypi_tls.py next to the .bat files.
+
+Manual equivalent:
+   python pypi_tls.py install --upgrade pip
+   python pypi_tls.py install -r requirements-gemini.txt
+
+Force lab mode without waiting on the probe:
+   set FIDDLER_PIP_TRUSTED_HOST=1
+   python pypi_tls.py install -r requirements-gemini.txt
+
+Keep strict SSL (no fallback):
+   set FIDDLER_PIP_STRICT_SSL=1
+
+Do not set PYTHONHTTPSVERIFY=0. That weakens Gemini/DeepSeek/MCP HTTPS too.
+
+If pip still fails after trusted-host, that is a real block or proxy, not TLS.
 
 Error: "[WinError 5] Access is denied"
 Solution: Antivirus blocking installation

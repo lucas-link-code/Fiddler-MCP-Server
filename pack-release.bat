@@ -35,6 +35,7 @@ for %%F in (
     gemini_native_tools.py
     llm_prompts.py
     llm_tool_schema.py
+    pypi_tls.py
     requirements-gemini.txt
     CustomRules.js
     deploy-mcp.bat

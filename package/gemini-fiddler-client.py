@@ -64,6 +64,7 @@ REQUIRED_SCRIPTS = (
     "gemini_native_tools.py",
     "llm_prompts.py",
     "llm_tool_schema.py",
+    "pypi_tls.py",
 )
 
 
@@ -151,22 +152,22 @@ def ensure_python_dependencies(script_dir: Optional[Path] = None, auto_install: 
 
     print(f"[!] Missing packages: {', '.join(_requirement_base_name(r) for r in missing_reqs)}")
     if not auto_install:
-        print("[!] Auto-install disabled. Run: pip install -r requirements-gemini.txt")
+        print("[!] Auto-install disabled. Run: python pypi_tls.py install -r requirements-gemini.txt")
         return False
 
-    py = _python_executable()
-    cmd = [py, "-m", "pip", "install", "--upgrade"]
+    pip_args = ["install", "--upgrade"]
     if req_path.exists():
-        cmd.extend(["-r", str(req_path)])
+        pip_args.extend(["-r", str(req_path)])
         print(f"[*] Installing from {req_path.name} ...")
     else:
-        cmd.extend(missing_reqs)
+        pip_args.extend(missing_reqs)
         print(f"[*] Installing: {' '.join(missing_reqs)}")
 
     try:
-        result = subprocess.run(cmd, cwd=str(root), check=False)
-        if result.returncode != 0:
-            print(f"[X] pip install failed with exit code {result.returncode}")
+        import pypi_tls
+        rc = pypi_tls.run_pip(pip_args, cwd=str(root))
+        if rc != 0:
+            print(f"[X] pip install failed with exit code {rc}")
             return False
     except Exception as exc:
         print(f"[X] pip install failed: {exc}")
@@ -181,7 +182,7 @@ def ensure_python_dependencies(script_dir: Optional[Path] = None, auto_install: 
             still_missing.append(base)
     if still_missing:
         print(f"[X] Still missing after install: {', '.join(still_missing)}")
-        print("[!] Try manually: python -m pip install -r requirements-gemini.txt")
+        print("[!] Try manually: python pypi_tls.py install -r requirements-gemini.txt")
         return False
 
     print("[+] Dependencies installed successfully")
@@ -409,7 +410,7 @@ class GeminiFiddlerClient:
         if not GENAI_AVAILABLE or genai is None:
             raise RuntimeError(
                 "google-generativeai is not installed. "
-                "Run: python -m pip install -r requirements-gemini.txt"
+                "Run: python pypi_tls.py install -r requirements-gemini.txt"
             )
         from llm_providers.gemini_provider import GeminiProvider
         self.llm_provider = GeminiProvider(api_key=self.api_key, model_name=self.model_name)

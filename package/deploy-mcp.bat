@@ -369,8 +369,14 @@ if errorlevel 1 (
     )
 )
 
+if not exist "%~dp0pypi_tls.py" (
+    echo    ERROR: pypi_tls.py not found
+    echo           Keep pypi_tls.py next to deploy-mcp.bat
+    exit /b 1
+)
+
 echo    Upgrading pip...
-python -m pip install --upgrade pip
+python "%~dp0pypi_tls.py" install --upgrade pip
 if errorlevel 1 (
     echo    WARNING: Failed to upgrade pip, continuing with current version...
 )
@@ -381,7 +387,7 @@ if not exist "%~dp0requirements-gemini.txt" (
     echo    ERROR: requirements-gemini.txt not found
     exit /b 1
 )
-python -m pip install -r "%~dp0requirements-gemini.txt"
+python "%~dp0pypi_tls.py" install -r "%~dp0requirements-gemini.txt"
 set DEPS_RESULT=!ERRORLEVEL!
 if !DEPS_RESULT! NEQ 0 (
     echo.
@@ -731,7 +737,12 @@ echo      ping pypi.org
 echo      ping 8.8.8.8
 echo.
 echo   3. TEST MANUAL PIP INSTALL:
-echo      python -m pip install --upgrade pip
+echo      python pypi_tls.py install --upgrade pip
+echo      python pypi_tls.py install -r requirements-gemini.txt
+echo.
+echo      If Python TLS to pypi.org fails ^(CERTIFICATE_VERIFY_FAILED^):
+echo      set FIDDLER_PIP_TRUSTED_HOST=1
+echo      python pypi_tls.py install -r requirements-gemini.txt
 echo.
 echo   4. CHECK PROXY SETTINGS:
 echo      If behind corporate proxy, configure:
@@ -771,8 +782,8 @@ echo   diagnose-environment.bat
 echo.
 echo   This will test Python, pip, network, and permissions.
 echo.
-echo   Option 3: Install manually in a new Administrator command prompt
-echo   python -m pip install google-generativeai rich mcp pydantic Flask requests
+echo   Option 3: Install via pypi_tls.py in a new Administrator command prompt
+echo   python pypi_tls.py install -r requirements-gemini.txt
 echo.
 echo COMMON CAUSES:
 echo   - No internet connection

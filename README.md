@@ -111,6 +111,10 @@ If dependency install fails, run `package/install-dependencies-manual.bat` then 
 
 On FLARE VMs, pip often fails with `CERTIFICATE_VERIFY_FAILED` talking to pypi.org even when curl/ping work. pip uses its own CA bundle; Windows urllib can still succeed. `pypi_tls.py` probes pip's stack and retries with `--trusted-host` on cert failure. Force lab mode with `set FIDDLER_PIP_TRUSTED_HOST=1`.
 
+mcp 2.0 removed FastMCP. The bundle pins `mcp>=1.0.0,<2.0.0`. If 5ire-bridge fails with `No module named mcp.server.fastmcp`, reinstall that pin.
+
+FLARE `SSL_CERT_FILE` pointing at a single lab root such as `C:\ProgramData\Rep\rootCA.crt` must not be the only CA store for DeepSeek. The client merges it with the OS store and certifi. You should not need `DEEPSEEK_SSL_VERIFY=0` after this.
+
 See [TROUBLESHOOTING.txt](docs/TROUBLESHOOTING.txt). Common issues: Fiddler must be closed when CustomRules.js is copied; port 8081 must be free; Rules > Reload Script after deploy.
 
 ## Use cases

@@ -4,25 +4,23 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from llm_tool_schema import mcp_tools_to_openai_tools
 from gemini_native_tools import truncate_tool_result_for_model
-from llm_providers.deepseek_provider import resolve_ssl_verify
+from llm_providers.deepseek_provider import resolve_ssl_verify, ssl_verify_label
 
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "z-ai/glm-5.2"
 
 
-def _openrouter_ssl_verify(config_flag: Optional[Any] = None) -> Union[bool, str]:
-    """TLS verify for OpenRouter; honors OPENROUTER_* env then shared helper."""
-    env_flag = os.environ.get("OPENROUTER_SSL_VERIFY", "").strip().lower()
-    if env_flag in ("0", "false", "no", "off"):
-        return False
-    path = (os.environ.get("OPENROUTER_SSL_CERT_FILE") or "").strip()
-    if path and os.path.isfile(path):
-        return path
-    return resolve_ssl_verify(config_flag)
+def _openrouter_ssl_verify(config_flag: Optional[Any] = None):
+    """TLS verify for OpenRouter; does not inherit DEEPSEEK_SSL_VERIFY=0."""
+    return resolve_ssl_verify(
+        config_flag,
+        disable_env="OPENROUTER_SSL_VERIFY",
+        extra_cert_envs=("OPENROUTER_SSL_CERT_FILE",),
+    )
 
 
 class OpenRouterProvider:
@@ -51,7 +49,7 @@ class OpenRouterProvider:
                 "openrouter_ssl_verify=false). Lab use only."
             )
         else:
-            print(f"[*] OpenRouter TLS verify: {self._ssl_verify}")
+            print(f"[*] OpenRouter TLS verify: {ssl_verify_label(self._ssl_verify)}")
         timeout = float(os.environ.get("OPENROUTER_HTTP_TIMEOUT", "90"))
         self._http_client = httpx.Client(verify=self._ssl_verify, timeout=timeout)
         self._client = OpenAI(
@@ -118,12 +116,10 @@ class OpenRouterProvider:
         if "certificate" in lower or "ssl" in lower or "certifi" in lower:
             hints.append("URL is correct: https://openrouter.ai/api/v1")
             hints.append("This is a TLS trust problem on the VM, not a wrong API URL")
-            hints.append("Fix 1: pip install -U certifi then restart the client")
-            hints.append(
-                "Fix 2: set OPENROUTER_SSL_CERT_FILE to a CA PEM path, or "
-                "OPENROUTER_SSL_VERIFY=0 for lab-only bypass"
-            )
-            hints.append(f"Current verify setting: {self._ssl_verify!r}")
+            hints.append("Fix 1: restart this client. Lab SSL_CERT_FILE is merged into the OS/certifi store")
+            hints.append("Fix 2: extra intercept CA: set OPENROUTER_SSL_CERT_FILE to a PEM path")
+            hints.append("Fix 3 lab only: set OPENROUTER_SSL_VERIFY=0 then restart")
+            hints.append(f"Current verify setting: {ssl_verify_label(self._ssl_verify)}")
         elif "connection" in lower or "connect" in lower or "timeout" in lower or "name resolution" in lower:
             hints.append(f"Cannot reach OpenRouter API at {self.base_url}")
             hints.append("On the analysis VM run: curl -I https://openrouter.ai/api/v1")

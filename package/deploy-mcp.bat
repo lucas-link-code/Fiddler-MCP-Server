@@ -399,7 +399,7 @@ if !DEPS_RESULT! NEQ 0 (
 
 echo.
 echo    Verifying installations...
-python -c "import google.generativeai, rich, mcp, pydantic, flask, requests, openai, httpx, certifi; print('All packages verified')"
+python -c "from mcp.server.fastmcp import FastMCP; import google.generativeai, rich, mcp, pydantic, flask, requests, openai, httpx, certifi; print('All packages verified')"
 if errorlevel 1 (
     echo    WARNING: Some packages failed to import
     echo             The system may not work correctly

@@ -83,7 +83,7 @@ Step 3: Upgrade pip
 Step 4: Install each package individually
    python -m pip install google-generativeai
    python -m pip install rich
-   python -m pip install mcp
+   python pypi_tls.py install "mcp>=1.0.0,<2.0.0"
    python -m pip install pydantic
    python -m pip install Flask
    python -m pip install requests
@@ -91,7 +91,7 @@ Step 4: Install each package individually
 Step 5: Verify installations
    python -c "import google.generativeai; print('OK')"
    python -c "import rich; print('OK')"
-   python -c "import mcp; print('OK')"
+   python -c "from mcp.server.fastmcp import FastMCP; print('OK')"
    python -c "import pydantic; print('OK')"
    python -c "import flask; print('OK')"
    python -c "import requests; print('OK')"
@@ -134,6 +134,21 @@ Keep strict SSL (no fallback):
 Do not set PYTHONHTTPSVERIFY=0. That weakens Gemini/DeepSeek/MCP HTTPS too.
 
 If pip still fails after trusted-host, that is a real block or proxy, not TLS.
+
+Error: "No module named mcp.server.fastmcp" when 5ire-bridge starts
+mcp 2.0 removed FastMCP. This package pins mcp>=1.0.0,<2.0.0. import mcp can
+succeed on mcp 2.x while 5ire-bridge.py still fails. Reinstall:
+
+   python pypi_tls.py install "mcp>=1.0.0,<2.0.0"
+   python -c "from mcp.server.fastmcp import FastMCP; print('OK')"
+
+Error: DeepSeek CERTIFICATE_VERIFY_FAILED with verify set to a lab rootCA.crt
+FLARE often sets SSL_CERT_FILE to C:\ProgramData\Rep\rootCA.crt. Using that
+file as the only httpx CA store drops public CAs, so api.deepseek.com fails.
+The client now merges that file into the OS store plus certifi. Unset
+DEEPSEEK_SSL_VERIFY if you set it to 0 for the old workaround. Last resort:
+
+   set DEEPSEEK_SSL_VERIFY=0
 
 Error: "[WinError 5] Access is denied"
 Solution: Antivirus blocking installation

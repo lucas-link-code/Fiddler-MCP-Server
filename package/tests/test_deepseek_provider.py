@@ -545,5 +545,78 @@ class TestProviderConfigAndModelResolution(unittest.TestCase):
         self.assertTrue(client._gemini_tool)
 
 
+class TestResolveSslVerify(unittest.TestCase):
+    _ENVS = (
+        "DEEPSEEK_SSL_VERIFY",
+        "DEEPSEEK_SSL_CERT_FILE",
+        "OPENROUTER_SSL_VERIFY",
+        "OPENROUTER_SSL_CERT_FILE",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    )
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self._ENVS}
+        for k in self._ENVS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_verify_disabled(self):
+        from llm_providers.deepseek_provider import resolve_ssl_verify
+
+        os.environ["DEEPSEEK_SSL_VERIFY"] = "0"
+        self.assertIs(resolve_ssl_verify(True), False)
+
+    def test_config_flag_disables(self):
+        import ssl
+        from llm_providers.deepseek_provider import resolve_ssl_verify
+
+        self.assertIs(resolve_ssl_verify(False), False)
+        self.assertIsInstance(resolve_ssl_verify(True), ssl.SSLContext)
+
+    def test_lab_ca_file_is_merged_not_exclusive(self):
+        import ssl
+        import certifi
+        from llm_providers.deepseek_provider import resolve_ssl_verify, ssl_verify_label
+
+        ca = certifi.where()
+        os.environ["SSL_CERT_FILE"] = ca
+        result = resolve_ssl_verify()
+        self.assertIsInstance(result, ssl.SSLContext)
+        self.assertNotEqual(result, ca)
+        label = ssl_verify_label(result)
+        self.assertIn("OS trust store", label)
+        self.assertIn("certifi", label)
+        self.assertIn(ca, label)
+
+    def test_openrouter_does_not_inherit_deepseek_disable(self):
+        import ssl
+        from llm_providers.openrouter_provider import _openrouter_ssl_verify
+
+        os.environ["DEEPSEEK_SSL_VERIFY"] = "0"
+        result = _openrouter_ssl_verify()
+        self.assertIsInstance(result, ssl.SSLContext)
+
+
+class TestMcpRequirementPin(unittest.TestCase):
+    def test_mcp_pin_excludes_v2(self):
+        text = Path(ROOT, "requirements-gemini.txt").read_text(encoding="utf-8")
+        mcp_lines = [
+            ln.strip()
+            for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#") and ln.strip().startswith("mcp")
+        ]
+        self.assertEqual(len(mcp_lines), 1)
+        self.assertIn("<2.0.0", mcp_lines[0])
+        self.assertIn(">=1.0.0", mcp_lines[0])
+
+
 if __name__ == "__main__":
     unittest.main()

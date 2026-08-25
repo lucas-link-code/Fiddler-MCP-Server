@@ -116,6 +116,13 @@ for %%M in (google.generativeai rich mcp pydantic flask requests openai httpx ce
         set VERIFY_FAILED=1
     )
 )
+echo Checking mcp.server.fastmcp...
+python -c "from mcp.server.fastmcp import FastMCP; print('  OK')" 2>nul
+if errorlevel 1 (
+    echo   FAILED: Cannot import FastMCP from mcp.server.fastmcp
+    echo   mcp 2.0 removed FastMCP. Install: python pypi_tls.py install "mcp>=1.0.0,<2.0.0"
+    set VERIFY_FAILED=1
+)
 
 echo.
 if %VERIFY_FAILED% EQU 1 (

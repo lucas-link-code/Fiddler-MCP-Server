@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+import ssl
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from llm_tool_schema import mcp_tools_to_openai_tools
 from gemini_native_tools import truncate_tool_result_for_model
@@ -12,45 +13,93 @@ from gemini_native_tools import truncate_tool_result_for_model
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
+_FALSE = {"0", "false", "no", "off"}
+_TRUE = {"1", "true", "yes", "on"}
+_SHARED_CA_ENVS = (
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
+SslVerify = Union[bool, ssl.SSLContext]
 
-def resolve_ssl_verify(config_flag: Optional[Any] = None) -> Union[bool, str]:
-    """CA path or verify flag for httpx.
 
-    Order:
-    1. DEEPSEEK_SSL_VERIFY env = 0/false -> disable verify (lab only; insecure)
-    2. config_flag False / 0 / "false" -> disable verify
-    3. DEEPSEEK_SSL_CERT_FILE / SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE
-    4. certifi CA bundle
-    5. True (system defaults)
-    """
-    env_flag = os.environ.get("DEEPSEEK_SSL_VERIFY", "").strip().lower()
-    if env_flag in ("0", "false", "no", "off"):
-        return False
-    if env_flag in ("1", "true", "yes", "on"):
-        # force verify on even if config says otherwise
-        pass
-    else:
-        if isinstance(config_flag, bool) and config_flag is False:
-            return False
-        if isinstance(config_flag, (int, float)) and int(config_flag) == 0:
-            return False
-        if isinstance(config_flag, str) and config_flag.strip().lower() in ("0", "false", "no", "off"):
-            return False
+def _config_disables_verify(config_flag: Optional[Any]) -> bool:
+    if isinstance(config_flag, bool) and config_flag is False:
+        return True
+    if isinstance(config_flag, (int, float)) and int(config_flag) == 0:
+        return True
+    if isinstance(config_flag, str) and config_flag.strip().lower() in _FALSE:
+        return True
+    return False
 
-    for env in (
-        "DEEPSEEK_SSL_CERT_FILE",
-        "SSL_CERT_FILE",
-        "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
-    ):
+
+def _ca_files(*extra_envs: str) -> List[str]:
+    ordered = tuple(extra_envs) + _SHARED_CA_ENVS
+    out: List[str] = []
+    seen = set()
+    for env in ordered:
         path = (os.environ.get(env) or "").strip()
-        if path and os.path.isfile(path):
-            return path
+        if not path or not os.path.isfile(path):
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def ssl_verify_label(verify: SslVerify) -> str:
+    if verify is False:
+        return "disabled"
+    if verify is True:
+        return "system defaults"
+    label = getattr(verify, "_fiddler_ca_label", None)
+    return str(label or "SSLContext")
+
+
+def build_merged_ssl_context(extra_cert_envs: Sequence[str] = ()) -> ssl.SSLContext:
+    """OS trust store plus certifi plus extra PEM files.
+
+    FLARE often sets SSL_CERT_FILE to a single lab root such as
+    C:/ProgramData/Rep/rootCA.crt. Using that path as the only httpx verify
+    store drops public CAs, so api.deepseek.com fails even when the file exists.
+    """
+    ctx = ssl.create_default_context()
+    parts = ["OS trust store"]
     try:
         import certifi
-        return certifi.where()
+        ctx.load_verify_locations(cafile=certifi.where())
+        parts.append("certifi")
     except Exception:
-        return True
+        pass
+    for path in _ca_files(*extra_cert_envs):
+        try:
+            ctx.load_verify_locations(cafile=path)
+            parts.append(path)
+        except Exception as exc:
+            print(f"[!] Skipping extra CA {path}: {exc}")
+    ctx._fiddler_ca_label = " + ".join(parts)  # type: ignore[attr-defined]
+    return ctx
+
+
+def resolve_ssl_verify(
+    config_flag: Optional[Any] = None,
+    *,
+    disable_env: str = "DEEPSEEK_SSL_VERIFY",
+    extra_cert_envs: Sequence[str] = ("DEEPSEEK_SSL_CERT_FILE",),
+) -> SslVerify:
+    """httpx verify value: False, or an SSLContext that merges lab CA files.
+
+    disable_env=0/false disables verify. A lab CA env file is appended to the
+    default store; it is never used as the sole bundle.
+    """
+    env_flag = (os.environ.get(disable_env) or "").strip().lower()
+    if env_flag in _FALSE:
+        return False
+    if env_flag not in _TRUE and _config_disables_verify(config_flag):
+        return False
+    return build_merged_ssl_context(extra_cert_envs)
 
 
 class DeepSeekProvider:
@@ -80,7 +129,7 @@ class DeepSeekProvider:
                 "deepseek_ssl_verify=false). Lab use only."
             )
         else:
-            print(f"[*] DeepSeek TLS verify: {self._ssl_verify}")
+            print(f"[*] DeepSeek TLS verify: {ssl_verify_label(self._ssl_verify)}")
         timeout = float(os.environ.get("DEEPSEEK_HTTP_TIMEOUT", "90"))
         self._http_client = httpx.Client(verify=self._ssl_verify, timeout=timeout)
         self._client = OpenAI(
@@ -142,10 +191,10 @@ class DeepSeekProvider:
         if "certificate" in lower or "ssl" in lower or "certifi" in lower:
             hints.append("URL is correct: https://api.deepseek.com (official DeepSeek OpenAI base_url)")
             hints.append("This is a TLS trust problem on the VM, not a wrong API URL")
-            hints.append("Fix 1: pip install -U certifi then restart the client")
-            hints.append("Fix 2: if a corporate proxy MITMs HTTPS, export the corp root CA as PEM and set DEEPSEEK_SSL_CERT_FILE=C:\\path\\to\\corp-ca.pem")
+            hints.append("Fix 1: restart this client. Lab SSL_CERT_FILE is merged into the OS/certifi store, not used as the only CA file")
+            hints.append("Fix 2: extra intercept CA: set DEEPSEEK_SSL_CERT_FILE to a PEM path")
             hints.append("Fix 3 lab only: set DEEPSEEK_SSL_VERIFY=0 then restart (disables cert checks; insecure)")
-            hints.append(f"Current verify setting: {self._ssl_verify!r}")
+            hints.append(f"Current verify setting: {ssl_verify_label(self._ssl_verify)}")
         elif "connection" in lower or "connect" in lower or "timeout" in lower or "name resolution" in lower:
             hints.append(f"Cannot reach DeepSeek API at {self.base_url}")
             hints.append("Official base URL is https://api.deepseek.com (also accepts /v1)")

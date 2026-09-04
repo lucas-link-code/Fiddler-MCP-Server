@@ -345,7 +345,7 @@ class TestNativeChatHelpers(unittest.TestCase):
         client.available_tools = SAMPLE_TOOLS
         client.use_native_tools = True
         client.log_with_timestamp = MagicMock()
-        with patch.object(gemini.genai, "GenerativeModel", return_value=MagicMock()) as gm:
+        with patch("google.generativeai.GenerativeModel", return_value=MagicMock()) as gm:
             from llm_providers.gemini_provider import GeminiProvider
             client.llm_provider = GeminiProvider(api_key="test-key", model_name=client.model_name)
             ok = client.bind_gemini_tools()

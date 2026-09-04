@@ -131,5 +131,20 @@ O7. TLS on FLARE VM
     CERTIFICATE_VERIFY_FAILED: set openrouter_ssl_verify false or OPENROUTER_SSL_VERIFY=0 (lab only)
     Check: curl -I https://openrouter.ai/api/v1
 
+Hang UX
+=======
+
+H1. Happy-path status lines
+    /investigate on a live buffer
+    Expect: breadcrumbs like -> session_body N unchanged
+    Expect: LLM thinking Ns then LLM reply
+    Expect: HTTP 8081 ok on tool calls
+
+H2. Flask down mid-investigate
+    Stop enhanced-bridge or pause its console, then ask again
+    Expect: HTTP 8081 timeout twice, then Stopping tools
+    Expect: no third 10s wait
+    Expect: prompt returns. Next question retries 8081
+
 Do not remove call_tool sanitize, refetch lock, MCP restart, or auto-fetch after soak.
 Rollback tags if needed: pre-deepseek-restore or pre-openrouter-restore

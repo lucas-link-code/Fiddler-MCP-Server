@@ -11,6 +11,7 @@ generated_ekfiddle_rules.txt
 
 # Runtime logs and local backups
 mcp_server.err.log
+enhanced-bridge.log
 *.7z
 *.zip
 !/Fiddler-MCP-Bundle.zip

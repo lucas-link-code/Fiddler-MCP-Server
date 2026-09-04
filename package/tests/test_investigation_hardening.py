@@ -16,7 +16,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -460,6 +460,210 @@ class TestCompareSanitizeAndStatus(unittest.TestCase):
         # Benign + not asked for rules => Low dropped; High still saved if present
         self.assertTrue(all(not r.split("\t")[1].startswith("Low:") for r in saved))
         self.assertTrue(any("SocGholish" in r for r in saved))
+
+
+class TestRequestRetryPolicy(unittest.TestCase):
+    def test_does_not_retry_timeout(self):
+        client = fiveire.FiddlerBridgeClient()
+        client.request = MagicMock(
+            side_effect=fiveire.BridgeRequestError("Bridge request timed out")
+        )
+        with self.assertRaises(fiveire.BridgeRequestError):
+            client.request_with_retry("GET", "/api/stats")
+        self.assertEqual(client.request.call_count, 1)
+
+    def test_retries_connection_error(self):
+        client = fiveire.FiddlerBridgeClient()
+        client.max_retries = 2
+        client.request = MagicMock(
+            side_effect=[fiveire.BridgeConnectionError("down"), {"ok": True}]
+        )
+        with patch.object(fiveire, "sleep"):
+            out = client.request_with_retry("GET", "/api/stats")
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(client.request.call_count, 2)
+
+
+class TestBridgeHangFixes(unittest.TestCase):
+    def _client(self):
+        client = gemini.GeminiFiddlerClient.__new__(gemini.GeminiFiddlerClient)
+        client._analyzed_session_ids = set()
+        client._current_user_query = "investigate"
+        client._last_search_args = {}
+        client.available_tools = [{"name": "fiddler_mcp__live_stats"}]
+        client.verbose_logging = False
+        client.show_progress = False
+        client.log_with_timestamp = MagicMock()
+        client.mcp_stderr_file = None
+        client.tool_timeout = 30
+        client._reset_bridge_circuit()
+        client.is_enhanced_bridge_healthy = MagicMock(return_value=False)
+        client.clear_interrupt = MagicMock()
+        client.conversation_history = []
+        return client
+
+    def test_classify_http_timeout_vs_mcp_stdio(self):
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._classify_bridge_error(
+                result={"error": "Failed to get stats: Bridge request timed out"}
+            ),
+            "http_timeout",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._classify_bridge_error(
+                result={"error": "MCP child did not reply in 30s (no console; it is this client's python.exe child). HTTP 8081 may still be the cause."}
+            ),
+            "mcp_stdio",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._classify_bridge_error(
+                exc=RuntimeError("MCP server response timeout (30s) - server may not be responding")
+            ),
+            "mcp_stdio",
+        )
+        self.assertIsNone(
+            gemini.GeminiFiddlerClient._classify_bridge_error(
+                result={"error": "Maximum 10 sessions per comparison (to prevent timeout)"}
+            )
+        )
+
+    def test_status_formatter_strings(self):
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._status_line_wait("LLM thinking", 12),
+            "LLM thinking 12s",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._status_line_done("HTTP 8081 ok", 0.4),
+            "HTTP 8081 ok (0.4s)",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._status_line_done("HTTP 8081 timeout", 10.0),
+            "HTTP 8081 timeout (10.0s)",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._status_line_done("MCP child timeout", 30.0),
+            "MCP child timeout (30.0s)",
+        )
+        self.assertEqual(
+            gemini.GeminiFiddlerClient._status_line_done("LLM report", 8.1),
+            "LLM report (8.1s)",
+        )
+
+    def test_streak_opens_on_second_timeout_success_resets(self):
+        client = self._client()
+        timeout = {"success": False, "error": "Search failed: Bridge request timed out"}
+        client._note_tool_outcome(timeout)
+        self.assertFalse(client._http_circuit_open)
+        self.assertEqual(client._http_timeout_streak, 1)
+        client._note_tool_outcome(timeout)
+        self.assertTrue(client._http_circuit_open)
+        client._reset_bridge_circuit()
+        client._note_tool_outcome(timeout)
+        client._note_tool_outcome({"success": True, "sessions": []})
+        self.assertEqual(client._http_timeout_streak, 0)
+        self.assertFalse(client._http_circuit_open)
+        self.assertEqual(client._successful_tools_this_query, 1)
+
+    def test_chat_resets_circuit(self):
+        client = self._client()
+        client._http_timeout_streak = 5
+        client._http_circuit_open = True
+        client.ensure_mcp_alive = MagicMock(return_value=False)
+        out = client.chat("try now")
+        self.assertIn("MCP server is not running", out)
+        self.assertFalse(client._http_circuit_open)
+        self.assertEqual(client._http_timeout_streak, 0)
+
+    def test_call_tool_skips_http_when_circuit_open(self):
+        client = self._client()
+        client._http_circuit_open = True
+        client._http_circuit_error = "HTTP 8081 not answering. Stopping tools."
+        client.send_mcp_request = MagicMock()
+        result = client.call_tool("fiddler_mcp__live_stats", {})
+        client.send_mcp_request.assert_not_called()
+        self.assertTrue(result.get("circuit_open"))
+        self.assertIn("8081", result.get("error", ""))
+
+    def test_call_tool_catches_mcp_stdio_timeout(self):
+        client = self._client()
+        client.send_mcp_request = MagicMock(
+            side_effect=RuntimeError("MCP server response timeout (30s) - server may not be responding")
+        )
+        result = client.call_tool("fiddler_mcp__live_stats", {})
+        self.assertEqual(result.get("error_class"), "mcp_stdio")
+        self.assertIn("MCP child did not reply", result.get("error", ""))
+        self.assertIn("no console", result.get("error", ""))
+
+    def test_native_loop_stops_after_two_timeouts(self):
+        client = self._client()
+        client.use_native_tools = True
+        client._gemini_tool = True
+        client.provider_name = "deepseek"
+        client.max_followups = 20
+        client._interrupt_requested = False
+        client.use_rich = False
+        client.console = None
+        client._format_recent_history = MagicMock(return_value="")
+        client._analyzed_sessions_note = MagicMock(return_value="No sessions")
+        client.maybe_persist_ekfiddle_rules = MagicMock(return_value=[])
+        client._finalize_assistant_response = lambda t: t
+        client.parse_gemini_response = MagicMock(return_value=None)
+        order = []
+
+        def fake_call(name, args):
+            order.append(name)
+            result = {"success": False, "error": "Failed to get stats: Bridge request timed out"}
+            client._note_tool_outcome(result)
+            return result
+
+        client.call_tool = fake_call
+
+        class FakeDeepSeek:
+            display_label = "DeepSeek"
+
+            def tools_bound(self):
+                return True
+
+            def start_conversation(self, user_text):
+                return [{"role": "user", "content": user_text}]
+
+            def generate(self, conversation, tool_choice="auto"):
+                self.generate_calls += 1
+                return {
+                    "calls": [
+                        {"name": "fiddler_mcp__live_stats", "args": {}, "id": "1"},
+                        {"name": "fiddler_mcp__ekfiddle_threats", "args": {}, "id": "2"},
+                        {"name": "fiddler_mcp__sessions_search", "args": {}, "id": "3"},
+                    ],
+                    "text": "",
+                }
+
+            def extract_tool_calls(self, response):
+                return list(response.get("calls") or [])
+
+            def extract_text(self, response):
+                return response.get("text") or ""
+
+            def append_model_turn(self, conversation, response, calls, text):
+                conversation.append({"role": "assistant"})
+
+            def append_tool_results(self, conversation, executed, nudge):
+                conversation.append({"role": "tool"})
+
+            def append_user_text(self, conversation, text):
+                conversation.append({"role": "user", "content": text})
+
+        provider = FakeDeepSeek()
+        provider.generate_calls = 0
+        client.llm_provider = provider
+        out = client._chat_native("investigate")
+        self.assertEqual(len(order), 2)
+        self.assertEqual(provider.generate_calls, 1)
+        self.assertIn("8081", out)
+
+    def test_disable_quick_edit_does_not_raise(self):
+        gemini._disable_quick_edit()
+        enhanced._disable_quick_edit()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ This version addresses naming conventions, schema clarity, and LLM usability iss
 """
 
 import json
+import logging
+import os
 import sys
 import asyncio
 import requests
@@ -19,6 +21,26 @@ from flask import Flask, request, jsonify
 
 MAX_BODY_PREVIEW_BYTES = 50_000
 LARGE_BODY_WARNING_BYTES = 100_000
+
+
+def _disable_quick_edit() -> None:
+    """Clear Windows Quick Edit so a console click does not pause Flask."""
+    if os.environ.get("FIDDLER_KEEP_QUICK_EDIT", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        new_mode = mode.value | 0x0080
+        new_mode &= ~0x0040
+        kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        return
 
 class EnhancedFiddlerMCPBridge:
     def __init__(self):
@@ -3270,7 +3292,26 @@ class EnhancedFiddlerRealtimeBridge:
     
     def run(self, host='localhost', port=8081):
         """Start the enhanced real-time bridge server"""
+        _disable_quick_edit()
         self.start_time = time.time()
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(log_dir, "enhanced-bridge.log")
+        try:
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            )
+            wz = logging.getLogger("werkzeug")
+            wz.setLevel(logging.INFO)
+            wz.propagate = False
+            wz.handlers = [h for h in wz.handlers if not isinstance(h, logging.FileHandler)]
+            wz.addHandler(file_handler)
+            err_handler = logging.StreamHandler(sys.stderr)
+            err_handler.setLevel(logging.WARNING)
+            wz.addHandler(err_handler)
+        except Exception:
+            pass
         print(" Enhanced Fiddler Bridge - Data Extraction Mode")
         print(" Using port 8081 for Windows compatibility")
         print()
@@ -3309,6 +3350,7 @@ class EnhancedFiddlerRealtimeBridge:
                 raise
 
 if __name__ == "__main__":
+    _disable_quick_edit()
     print(" Enhanced Fiddler Bridge - Streamlined Toolset")
     print(" Windows-compatible on port 8081")
     print()

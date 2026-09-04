@@ -160,7 +160,7 @@ class FiddlerBridgeClient:
 
         try:
             return self.request(method, path, params=params, json_payload=json_payload, timeout=timeout)
-        except (BridgeConnectionError, BridgeRequestError) as exc:
+        except BridgeConnectionError as exc:
             if attempt < self.max_retries:
                 wait_time = 2 ** attempt
                 logging.warning(
@@ -180,6 +180,8 @@ class FiddlerBridgeClient:
                     timeout=timeout,
                     attempt=attempt + 1,
                 )
+            raise
+        except BridgeRequestError:
             raise
 
     # Tool implementations -------------------------------------------------

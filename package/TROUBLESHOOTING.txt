@@ -142,6 +142,23 @@ succeed on mcp 2.x while 5ire-bridge.py still fails. Reinstall:
    python pypi_tls.py install "mcp>=1.0.0,<2.0.0"
    python -c "from mcp.server.fastmcp import FastMCP; print('OK')"
 
+Investigate hangs / HTTP 8081 timeout vs MCP child timeout
+There is no MCP console. 5ire-bridge.py is a hidden python.exe child of the Gemini client.
+
+Client status HTTP 8081 timeout means Flask on 127.0.0.1:8081 did not answer. MCP still replied with an error JSON.
+Client status MCP child timeout means the hidden child did not write a JSON line in time. HTTP 8081 may still be the cause.
+
+If the Fiddler MCP Bridge title bar says Select, press Esc. A click in that console with Quick Edit pauses Flask.
+Quick Edit is disabled at start. Set FIDDLER_KEEP_QUICK_EDIT=1 to keep the old click-to-select behavior.
+Request logs go to enhanced-bridge.log next to the script.
+
+After two timeouts the client stops the tool chain. Next question retries.
+
+Check Flask:
+   curl http://127.0.0.1:8081/health
+
+Restart enhanced-bridge.py if health hangs. Restart the Gemini client only if you need a new MCP child.
+
 Error: DeepSeek CERTIFICATE_VERIFY_FAILED with verify set to a lab rootCA.crt
 FLARE often sets SSL_CERT_FILE to C:\ProgramData\Rep\rootCA.crt. Using that
 file as the only httpx CA store drops public CAs, so api.deepseek.com fails.

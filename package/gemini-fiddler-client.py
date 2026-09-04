@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -44,6 +45,26 @@ except ImportError:
     RICH_AVAILABLE = False
     Console = None  # type: ignore
     Markdown = None  # type: ignore
+
+def _disable_quick_edit() -> None:
+    """Clear Windows Quick Edit so a console click does not pause the process."""
+    if os.environ.get("FIDDLER_KEEP_QUICK_EDIT", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        new_mode = mode.value | 0x0080
+        new_mode &= ~0x0040
+        kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        return
+
 
 # Package name in requirements -> import module name
 _REQ_IMPORT_MAP = {
@@ -339,6 +360,11 @@ class GeminiFiddlerClient:
         self._analyzed_session_ids: set = set()
         self._last_search_args: Dict[str, Any] = {}
         self._interrupt_requested = False
+        self._http_timeout_streak = 0
+        self._http_circuit_open = False
+        self._http_circuit_error: Optional[str] = None
+        self._http_circuit_hint: Optional[str] = None
+        self._successful_tools_this_query = 0
         self._bridge_process = None  # optional handle if we spawned enhanced-bridge ourselves
         self.script_dir = Path(__file__).resolve().parent
         self.bridge_url = os.environ.get("FIDDLER_BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
@@ -856,6 +882,141 @@ class GeminiFiddlerClient:
         return f"  -> {short}"
 
     @staticmethod
+    def _status_line_wait(label: str, elapsed_s: int) -> str:
+        return f"{label} {elapsed_s}s"
+
+    @staticmethod
+    def _status_line_done(label: str, elapsed_s: float) -> str:
+        return f"{label} ({elapsed_s:.1f}s)"
+
+    @staticmethod
+    def _classify_bridge_error(
+        result: Optional[Dict[str, Any]] = None,
+        exc: Optional[BaseException] = None,
+    ) -> Optional[str]:
+        """Return http_timeout, mcp_stdio, or None."""
+        if exc is not None:
+            msg = str(exc).lower()
+            if "mcp server response timeout" in msg or "may not be responding" in msg:
+                return "mcp_stdio"
+            if "mcp server closed connection" in msg or "mcp server process has terminated" in msg:
+                return "mcp_stdio"
+            return None
+        if not isinstance(result, dict):
+            return None
+        tagged = result.get("error_class")
+        if tagged in ("http_timeout", "mcp_stdio"):
+            return tagged
+        err = str(result.get("error") or "").lower()
+        if "mcp child did not reply" in err or "mcp server response timeout" in err:
+            return "mcp_stdio"
+        if "mcp server process has terminated" in err or "mcp server closed connection" in err:
+            return "mcp_stdio"
+        if "timed out" in err:
+            return "http_timeout"
+        return None
+
+    def _reset_bridge_circuit(self) -> None:
+        self._http_timeout_streak = 0
+        self._http_circuit_open = False
+        self._http_circuit_error = None
+        self._http_circuit_hint = None
+        self._successful_tools_this_query = 0
+
+    def _circuit_skip_result(self) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "error": getattr(self, "_http_circuit_error", None)
+            or "HTTP 8081 not answering. Stopping tools.",
+            "error_class": "http_timeout",
+            "circuit_open": True,
+            "hint": getattr(self, "_http_circuit_hint", None)
+            or "Check the Fiddler MCP Bridge window or restart enhanced-bridge.py.",
+        }
+
+    def _circuit_diagnostic_message(self) -> str:
+        err = getattr(self, "_http_circuit_error", None) or "HTTP 8081 not answering. Stopping tools."
+        hint = getattr(self, "_http_circuit_hint", None) or (
+            "Check the Fiddler MCP Bridge window or restart enhanced-bridge.py."
+        )
+        return f"{err}\n{hint}"
+
+    def _open_bridge_circuit(self, cls: str, result: Optional[Dict[str, Any]]) -> None:
+        self._http_circuit_open = True
+        healthy = False
+        try:
+            healthy = bool(self.is_enhanced_bridge_healthy())
+        except Exception:
+            healthy = False
+        if cls == "mcp_stdio" and healthy:
+            line = "MCP child timeout. Stopping tools."
+            hint = "No MCP window. Restart the Gemini client to respawn 5ire-bridge.py."
+            err = (result or {}).get("error") if isinstance(result, dict) else None
+            err = err or line
+        else:
+            line = "HTTP 8081 not answering. Stopping tools."
+            hint = "Check the Fiddler MCP Bridge window or restart enhanced-bridge.py."
+            err = line
+        self._http_circuit_error = err
+        self._http_circuit_hint = hint
+        if getattr(self, "show_progress", True):
+            print(f"  {line}")
+            print(f"  {hint}")
+
+    def _note_tool_outcome(
+        self,
+        result: Optional[Dict[str, Any]],
+        error_class: Optional[str] = None,
+    ) -> None:
+        cls = error_class or self._classify_bridge_error(result=result)
+        if cls in ("http_timeout", "mcp_stdio"):
+            self._http_timeout_streak = getattr(self, "_http_timeout_streak", 0) + 1
+            if self._http_timeout_streak >= 2 and not getattr(self, "_http_circuit_open", False):
+                self._open_bridge_circuit(cls, result if isinstance(result, dict) else None)
+            return
+        if isinstance(result, dict) and result.get("error"):
+            return
+        self._http_timeout_streak = 0
+        if isinstance(result, dict) and result.get("success") is False:
+            return
+        self._successful_tools_this_query = getattr(self, "_successful_tools_this_query", 0) + 1
+
+    def _emit_status(self, line: str, *, newline: bool = True) -> None:
+        if not getattr(self, "show_progress", True):
+            return
+        pad = "                    "
+        if newline:
+            sys.stdout.write(f"\r  {line}{pad}\n")
+        else:
+            sys.stdout.write(f"\r  {line}{pad}")
+        sys.stdout.flush()
+
+    def _status_wait(self, wait_label: str, fn, done_label: Optional[str] = None):
+        """Run fn while ticking wait_label with elapsed seconds. Returns (result, elapsed_s)."""
+        start = time.time()
+        stop = threading.Event()
+        show = getattr(self, "show_progress", True)
+
+        def tick() -> None:
+            while not stop.wait(1.0):
+                elapsed = int(time.time() - start)
+                self._emit_status(self._status_line_wait(wait_label, elapsed), newline=False)
+
+        if show:
+            self._emit_status(self._status_line_wait(wait_label, 0), newline=False)
+            threading.Thread(target=tick, daemon=True).start()
+        try:
+            result = fn()
+        except BaseException:
+            stop.set()
+            raise
+        stop.set()
+        elapsed_s = time.time() - start
+        if done_label is not None:
+            self._emit_status(self._status_line_done(done_label, elapsed_s), newline=True)
+        return result, elapsed_s
+
+    @staticmethod
     def build_investigate_prompt(host: Optional[str] = None) -> str:
         """Canned malicious-traffic investigation prompt for /investigate."""
         scope = ""
@@ -1260,8 +1421,10 @@ class GeminiFiddlerClient:
             import select
             import sys
             
+            read_timeout = float(getattr(self, "tool_timeout", 30) or 30)
+            timeout_s = int(read_timeout)
+
             if sys.platform == "win32":
-                import threading
                 response_line = []
                 error = []
                 
@@ -1274,18 +1437,20 @@ class GeminiFiddlerClient:
                 
                 thread = threading.Thread(target=read_with_timeout, daemon=True)
                 thread.start()
-                thread.join(timeout=30.0)
+                thread.join(timeout=read_timeout)
                 
                 if not response_line:
                     if error:
                         raise RuntimeError(f"Read error: {error[0]}")
-                    raise RuntimeError("MCP server response timeout (30s) - server may not be responding")
+                    raise RuntimeError(
+                        f"MCP server response timeout ({timeout_s}s) - server may not be responding"
+                    )
                 
                 response_line = response_line[0]
             else:
-                ready = select.select([self.mcp_process.stdout], [], [], 30.0)
+                ready = select.select([self.mcp_process.stdout], [], [], read_timeout)
                 if not ready[0]:
-                    raise RuntimeError("MCP server response timeout (30s)")
+                    raise RuntimeError(f"MCP server response timeout ({timeout_s}s)")
                 response_line = self.mcp_process.stdout.readline()
             
             if not response_line:
@@ -1448,6 +1613,9 @@ class GeminiFiddlerClient:
                 "error": "MCP server process is not running and restart failed",
                 "hint": "Restart gemini-fiddler-client.py or start 5ire-bridge.py manually",
             }
+
+        if getattr(self, "_http_circuit_open", False):
+            return self._circuit_skip_result()
         
         # Handle non-prefixed tool names (LLM sometimes omits fiddler_mcp__ prefix)
         NON_PREFIXED_ALIASES = {
@@ -1565,25 +1733,37 @@ class GeminiFiddlerClient:
         
         if self.verbose_logging:
             self.log_with_timestamp(f"  Arguments: {json.dumps(arguments, indent=2)}", to_console=False, prefix="Client: ")
-        
-        # Progress indicator
-        spinner = ['|', '/', '-', '\\']
-        spinner_idx = 0
-        start_time = time.time()
-        
-        # Show initial progress - specify it's the Fiddler HTTP bridge
-        sys.stdout.write(f"\r  {spinner[spinner_idx]} Waiting for Fiddler HTTP bridge... (0s)")
-        sys.stdout.flush()
-        
-        response = self.send_mcp_request("tools/call", {"name": tool_name, "arguments": arguments})
-        
-        # Stop progress and show completion with descriptive info
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        elapsed_s = elapsed_ms / 1000
-        
+
+        timeout_s = int(getattr(self, "tool_timeout", 30) or 30)
+        mcp_child_err = (
+            f"MCP child did not reply in {timeout_s}s (no console; it is this client's python.exe child). "
+            "HTTP 8081 may still be the cause."
+        )
+        wait_started = time.time()
+        try:
+            response, elapsed_s = self._status_wait(
+                "HTTP 8081",
+                lambda: self.send_mcp_request(
+                    "tools/call", {"name": tool_name, "arguments": arguments}
+                ),
+            )
+        except RuntimeError as exc:
+            elapsed_s = time.time() - wait_started
+            cls = self._classify_bridge_error(exc=exc) or "mcp_stdio"
+            result = {
+                "success": False,
+                "error": mcp_child_err,
+                "error_class": cls,
+                "hint": "Restart gemini-fiddler-client.py to respawn the MCP child.",
+            }
+            self.log_with_timestamp(f"Bridge Result: error={result['error']}", to_console=False)
+            self._emit_status(self._status_line_done("MCP child timeout", elapsed_s))
+            self._note_tool_outcome(result, error_class=cls)
+            return result
+
+        elapsed_ms = int(elapsed_s * 1000)
         result = self._parse_tool_response(response)
 
-        # Short-circuit media bodies: no malware signal, waste tokens
         if (
             tool_name == "fiddler_mcp__session_body"
             and isinstance(result, dict)
@@ -1597,8 +1777,7 @@ class GeminiFiddlerClient:
                     "Skip media bodies; analyze JS/HTML/JSON sessions instead."
                 )
                 self.log_with_timestamp(msg, to_console=True, prefix="[!] ")
-                sys.stdout.write(f"\r  [Fiddler Bridge] Skipped media body ({elapsed_s:.1f}s)                    \n")
-                sys.stdout.flush()
+                self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
                 return {
                     "success": False,
                     "error": msg,
@@ -1607,43 +1786,61 @@ class GeminiFiddlerClient:
                     "media_skipped": True,
                     "hint": "Pick a text/html or application/javascript session for malware analysis.",
                 }
-        
-        # Enhanced result logging with session metadata
+
         try:
             if isinstance(result, dict):
+                cls = self._classify_bridge_error(result=result)
                 if result.get("error"):
-                    self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, error={result.get('error')}", to_console=False)
-                    sys.stdout.write(f"\r  [Fiddler Bridge] Error ({elapsed_s:.1f}s)                    \n")
-                elif 'sessions' in result:
-                    sessions = result.get('sessions', [])
+                    self.log_with_timestamp(
+                        f"Bridge Result: {elapsed_ms}ms, error={result.get('error')}",
+                        to_console=False,
+                    )
+                    if cls == "http_timeout":
+                        self._emit_status(self._status_line_done("HTTP 8081 timeout", elapsed_s))
+                    elif cls == "mcp_stdio":
+                        self._emit_status(self._status_line_done("MCP child timeout", elapsed_s))
+                    else:
+                        self._emit_status(self._status_line_done("HTTP 8081 error", elapsed_s))
+                elif "sessions" in result:
+                    sessions = result.get("sessions", [])
                     count = len(sessions)
-                    suspicious = sum(1 for s in sessions if s.get('risk_flag') or s.get('ekfiddle_comment'))
-                    ekfiddle = sum(1 for s in sessions if s.get('ekfiddle_comment'))
-                    self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, success=true, sessions={count}, suspicious={suspicious}, ekfiddle={ekfiddle}", to_console=False)
-                    sys.stdout.write(f"\r  [Fiddler Bridge] Received {count} sessions ({elapsed_s:.1f}s)                    \n")
-                elif 'response_body' in result or 'responseBody' in result:
-                    body = result.get('response_body', '') or result.get('responseBody', '') or ''
+                    suspicious = sum(1 for s in sessions if s.get("risk_flag") or s.get("ekfiddle_comment"))
+                    ekfiddle = sum(1 for s in sessions if s.get("ekfiddle_comment"))
+                    self.log_with_timestamp(
+                        f"Bridge Result: {elapsed_ms}ms, success=true, sessions={count}, suspicious={suspicious}, ekfiddle={ekfiddle}",
+                        to_console=False,
+                    )
+                    self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
+                elif "response_body" in result or "responseBody" in result:
+                    body = result.get("response_body", "") or result.get("responseBody", "") or ""
                     body_len = len(body)
-                    content_type = result.get('content_type', 'unknown')
-                    # Try to get host from result or infer from session data
-                    host = result.get('host', '')
-                    self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, success=true, content_type={content_type}, response_body={self._format_size(body_len)}", to_console=False)
+                    content_type = result.get("content_type", "unknown")
+                    host = result.get("host", "")
+                    self.log_with_timestamp(
+                        f"Bridge Result: {elapsed_ms}ms, success=true, content_type={content_type}, response_body={self._format_size(body_len)}",
+                        to_console=False,
+                    )
                     if host:
                         self.log_with_timestamp(f"Bridge Result: host={host}", to_console=False)
-                    sys.stdout.write(f"\r  [Fiddler Bridge] Received session body: {self._format_size(body_len)} ({elapsed_s:.1f}s)                    \n")
+                    self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
                 else:
                     result_size = len(json.dumps(result))
-                    self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, success=true, result_size={self._format_size(result_size)}", to_console=False)
-                    sys.stdout.write(f"\r  [Fiddler Bridge] Response received ({elapsed_s:.1f}s)                    \n")
+                    self.log_with_timestamp(
+                        f"Bridge Result: {elapsed_ms}ms, success=true, result_size={self._format_size(result_size)}",
+                        to_console=False,
+                    )
+                    self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
             else:
-                self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, unexpected_type={type(result)}", to_console=False)
-                sys.stdout.write(f"\r  [Fiddler Bridge] Response received ({elapsed_s:.1f}s)                    \n")
+                self.log_with_timestamp(
+                    f"Bridge Result: {elapsed_ms}ms, unexpected_type={type(result)}",
+                    to_console=False,
+                )
+                self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
         except Exception as e:
-            # Fallback if we can't parse the response
             self.log_with_timestamp(f"Bridge Result: {elapsed_ms}ms, parse_error={e}", to_console=False)
-            sys.stdout.write(f"\r  [Fiddler Bridge] Response received ({elapsed_s:.1f}s)                    \n")
-        
-        sys.stdout.flush()
+            self._emit_status(self._status_line_done("HTTP 8081 ok", elapsed_s))
+
+        self._note_tool_outcome(result if isinstance(result, dict) else None)
 
         if tool_name == "fiddler_mcp__sessions_search":
             self._last_search_args = dict(arguments or {})
@@ -2601,15 +2798,13 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
 
             while tool_call_count < max_calls:
                 self._check_interrupt()
-                sys.stdout.write(f"\r  Waiting for {label} LLM (native tools)...")
-                sys.stdout.flush()
-                llm_start = time.time()
-                response = provider.generate(conversation, tool_choice="auto")
+                response, llm_elapsed = self._status_wait(
+                    "LLM thinking",
+                    lambda: provider.generate(conversation, tool_choice="auto"),
+                    done_label="LLM reply",
+                )
                 self._check_interrupt()
-                llm_elapsed = time.time() - llm_start
                 total_llm_time += llm_elapsed
-                sys.stdout.write(f"\r  [{label} LLM] Response ({llm_elapsed:.1f}s)                    \n")
-                sys.stdout.flush()
 
                 calls = provider.extract_tool_calls(response)
                 text = provider.extract_text(response)
@@ -2642,6 +2837,8 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
 
                 executed = []
                 for call in calls:
+                    if getattr(self, "_http_circuit_open", False):
+                        break
                     self._check_interrupt()
                     name = call["name"]
                     args = call.get("args") or {}
@@ -2662,9 +2859,45 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
                         "content": json.dumps(result, indent=2, default=str)[:8000],
                     })
                     executed.append((name, args, result, call.get("id")))
+                    if getattr(self, "_http_circuit_open", False):
+                        break
 
-                nudge = llm_prompts.post_tool_nudge(self._analyzed_sessions_note())
-                provider.append_tool_results(conversation, executed, nudge)
+                if executed:
+                    nudge = llm_prompts.post_tool_nudge(self._analyzed_sessions_note())
+                    provider.append_tool_results(conversation, executed, nudge)
+
+                if getattr(self, "_http_circuit_open", False):
+                    if getattr(self, "_successful_tools_this_query", 0) == 0:
+                        msg = self._circuit_diagnostic_message()
+                        self.conversation_history.append({"role": "assistant", "content": msg})
+                        self.log_with_timestamp(
+                            f"Query Summary: native_tools/{self.provider_name} circuit, "
+                            f"llm={total_llm_time:.1f}s, bridge={total_bridge_time:.1f}s, "
+                            f"tool_calls={tool_call_count}",
+                            to_console=False,
+                        )
+                        return msg
+                    synth_prompt = llm_prompts.budget_synthesis_prompt(
+                        user_query, self._analyzed_sessions_note(), max_calls
+                    )
+                    provider.append_user_text(conversation, synth_prompt)
+                    synth_resp, synth_elapsed = self._status_wait(
+                        "LLM writing report",
+                        lambda: provider.generate(conversation, tool_choice="none"),
+                        done_label="LLM report",
+                    )
+                    total_llm_time += synth_elapsed
+                    final = provider.extract_text(synth_resp) or self._circuit_diagnostic_message()
+                    self.conversation_history.append({"role": "assistant", "content": final})
+                    self.log_with_timestamp(
+                        f"Query Summary: native_tools/{self.provider_name} circuit-synth, "
+                        f"llm={total_llm_time:.1f}s, bridge={total_bridge_time:.1f}s, "
+                        f"tool_calls={tool_call_count}",
+                        to_console=False,
+                    )
+                    return self._finalize_assistant_response(final)
+
+                continue
 
             # Budget exhausted — force text-only synthesis
             self.log_with_timestamp(
@@ -2675,13 +2908,12 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
                 user_query, self._analyzed_sessions_note(), max_calls
             )
             provider.append_user_text(conversation, synth_prompt)
-            sys.stdout.write(f"\r  Waiting for {label} LLM final synthesis...")
-            sys.stdout.flush()
-            synth_start = time.time()
-            synth_resp = provider.generate(conversation, tool_choice="none")
-            total_llm_time += time.time() - synth_start
-            sys.stdout.write(f"\r  [{label} LLM] Final synthesis complete                    \n")
-            sys.stdout.flush()
+            synth_resp, synth_elapsed = self._status_wait(
+                "LLM writing report",
+                lambda: provider.generate(conversation, tool_choice="none"),
+                done_label="LLM report",
+            )
+            total_llm_time += synth_elapsed
             final = provider.extract_text(synth_resp) or "Tool budget reached."
             self.conversation_history.append({"role": "assistant", "content": final})
             self.log_with_timestamp(
@@ -2722,6 +2954,7 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
         self._last_search_args = {}
         self.clear_interrupt()
         self._current_user_query = user_query
+        self._reset_bridge_circuit()
 
         # Recover MCP if a prior Ctrl+C killed the child process group
         if not self.ensure_mcp_alive():
@@ -2804,21 +3037,16 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
             self.log_with_timestamp(f"Gemini Request: prompt_length={prompt_length} chars (~{estimated_tokens} tokens)", to_console=False)
             self.log_with_timestamp(f"Gemini Request: user_query=\"{user_query[:80]}{'...' if len(user_query) > 80 else ''}\"", to_console=False)
             
-            # Show console feedback while waiting for Gemini
-            sys.stdout.write("\r  Waiting for Gemini LLM response...")
-            sys.stdout.flush()
-            
             start_time = time.time()
             self._check_interrupt()
-            response = self.model.generate_content(prompt)
+            response, elapsed_s = self._status_wait(
+                "LLM thinking",
+                lambda: self.model.generate_content(prompt),
+                done_label="LLM reply",
+            )
             self._check_interrupt()
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            elapsed_s = elapsed_ms / 1000
+            elapsed_ms = int(elapsed_s * 1000)
             total_gemini_time += elapsed_s
-            
-            # Clear the waiting message and show completion
-            sys.stdout.write(f"\r  [Gemini LLM] Response received ({elapsed_s:.1f}s)                    \n")
-            sys.stdout.flush()
             
             gemini_text = extract_text_safe(response)
             finish_reason = self._extract_finish_reason(response)
@@ -2860,6 +3088,12 @@ YOUR RESPONSE (if tool needed, use JSON format above; otherwise natural language
                 total_bridge_time += bridge_elapsed
                 tool_call_count += 1
                 self.log_with_timestamp(f"Tool Chain: call #{tool_call_count} -> {tool_name} ({bridge_elapsed*1000:.0f}ms)", to_console=False)
+
+                if getattr(self, "_http_circuit_open", False):
+                    if getattr(self, "_successful_tools_this_query", 0) == 0:
+                        msg = self._circuit_diagnostic_message()
+                        self.conversation_history.append({"role": "assistant", "content": msg})
+                        return msg
                 
                 # Add tool result to history
                 self.conversation_history.append({
@@ -2909,21 +3143,14 @@ Otherwise, provide your security-focused analysis or EKFiddle rules."""
                 self.log_with_timestamp(f"Gemini Request: type=tool_analysis, tool_result_size={self._format_size(tool_result_size)}", to_console=False)
                 self.log_with_timestamp(f"Gemini Request: analysis_prompt_length={analysis_prompt_len} chars (~{self._estimate_tokens(analysis_prompt)} tokens)", to_console=False)
                 
-                # Show console feedback
-                sys.stdout.write("\r  Waiting for Gemini LLM analysis...")
-                sys.stdout.flush()
-                
-                analysis_start = time.time()
+                analysis_response, analysis_elapsed_s = self._status_wait(
+                    "LLM thinking",
+                    lambda: self.model.generate_content(analysis_prompt),
+                    done_label="LLM reply",
+                )
                 self._check_interrupt()
-                analysis_response = self.model.generate_content(analysis_prompt)
-                self._check_interrupt()
-                analysis_elapsed_ms = int((time.time() - analysis_start) * 1000)
-                analysis_elapsed_s = analysis_elapsed_ms / 1000
+                analysis_elapsed_ms = int(analysis_elapsed_s * 1000)
                 total_gemini_time += analysis_elapsed_s
-                
-                # Show completion
-                sys.stdout.write(f"\r  [Gemini LLM] Analysis complete ({analysis_elapsed_s:.1f}s)                    \n")
-                sys.stdout.flush()
                 
                 final_text = extract_text_safe(analysis_response)
                 analysis_finish_reason = self._extract_finish_reason(analysis_response)
@@ -2984,6 +3211,12 @@ Otherwise, provide your security-focused analysis or EKFiddle rules."""
                     self._check_interrupt()
                     bridge_start = time.time()
                     next_tool_result = self.call_tool(next_tool_name, next_arguments)
+                    if getattr(self, "_http_circuit_open", False):
+                        if getattr(self, "_successful_tools_this_query", 0) == 0:
+                            msg = self._circuit_diagnostic_message()
+                            self.conversation_history.append({"role": "assistant", "content": msg})
+                            return msg
+                        break
                     self._check_interrupt()
                     bridge_elapsed = time.time() - bridge_start
                     total_bridge_time += bridge_elapsed
@@ -3034,21 +3267,14 @@ If calling a tool: brief note then {{"tool": "tool_name", "arguments": {{...}}}}
                     self.log_with_timestamp(f"Gemini Request: type=followup_analysis, tool_result_size={self._format_size(followup_result_size)}", to_console=False)
                     self.log_with_timestamp(f"Gemini Request: followup_prompt_length={len(followup_prompt)} chars (~{self._estimate_tokens(followup_prompt)} tokens)", to_console=False)
                     
-                    # Show console feedback
-                    sys.stdout.write(f"\r  Waiting for Gemini LLM follow-up #{followup_count}...")
-                    sys.stdout.flush()
-                    
-                    followup_start = time.time()
+                    followup_response, followup_elapsed_s = self._status_wait(
+                        "LLM thinking",
+                        lambda: self.model.generate_content(followup_prompt),
+                        done_label="LLM reply",
+                    )
                     self._check_interrupt()
-                    followup_response = self.model.generate_content(followup_prompt)
-                    self._check_interrupt()
-                    followup_elapsed_ms = int((time.time() - followup_start) * 1000)
-                    followup_elapsed_s = followup_elapsed_ms / 1000
+                    followup_elapsed_ms = int(followup_elapsed_s * 1000)
                     total_gemini_time += followup_elapsed_s
-                    
-                    # Show completion
-                    sys.stdout.write(f"\r  [Gemini LLM] Follow-up #{followup_count} complete ({followup_elapsed_s:.1f}s)                    \n")
-                    sys.stdout.flush()
                     
                     current_text = extract_text_safe(followup_response)
                     followup_finish_reason = self._extract_finish_reason(followup_response)
@@ -3094,14 +3320,12 @@ Provide a FINAL SYNTHESIS only:
 - Clear next manual steps if evidence is incomplete
 Do not emit any tool JSON."""
                     try:
-                        sys.stdout.write("\r  Waiting for Gemini LLM final synthesis...")
-                        sys.stdout.flush()
-                        synth_start = time.time()
-                        synth_resp = self.model.generate_content(synthesis_prompt)
-                        synth_elapsed = time.time() - synth_start
+                        synth_resp, synth_elapsed = self._status_wait(
+                            "LLM writing report",
+                            lambda: self.model.generate_content(synthesis_prompt),
+                            done_label="LLM report",
+                        )
                         total_gemini_time += synth_elapsed
-                        sys.stdout.write(f"\r  [Gemini LLM] Final synthesis complete ({synth_elapsed:.1f}s)                    \n")
-                        sys.stdout.flush()
                         synth_text = extract_text_safe(synth_resp)
                         if synth_text:
                             current_text = self._strip_tool_json_from_text(synth_text)
@@ -3715,6 +3939,8 @@ def main():
     """Main entry point"""
     import platform
     import signal
+
+    _disable_quick_edit()
 
     print("\nFiddler Traffic Analyzer (Gemini default; DeepSeek / OpenRouter optional)")
     print("=" * 70)

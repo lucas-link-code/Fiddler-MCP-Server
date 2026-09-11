@@ -53,18 +53,18 @@ The model never talks to Fiddler or Python directly. The client is the middleman
 
 ## MCP Tools
 
-| Tool | Purpose |
-|------|---------|
-| `fiddler_mcp__live_sessions` | List recent sessions with metadata and risk indicators |
-| `fiddler_mcp__sessions_search` | Filter by host, URL, status, method, size, MIME type |
-| `fiddler_mcp__session_headers` | Get request/response headers for a session |
-| `fiddler_mcp__session_body` | Get request/response bodies |
-| `fiddler_mcp__compare_sessions` | Fetch several session bodies for side-by-side analysis |
-| `fiddler_mcp__live_stats` | Buffer depth, capture rate, uptime |
-| `fiddler_mcp__sessions_timeline` | Aggregate by time, host, status, or content type |
-| `fiddler_mcp__sessions_clear` | Clear buffers after exporting evidence |
-| `fiddler_mcp__ekfiddle_sessions` | List sessions already flagged by EKFiddle |
-| `fiddler_mcp__ekfiddle_threats` | High-risk EKFiddle hits for triage |
+| Tool                             | Purpose                                                |
+| -------------------------------- | ------------------------------------------------------ |
+| `fiddler_mcp__live_sessions`     | List recent sessions with metadata and risk indicators |
+| `fiddler_mcp__sessions_search`   | Filter by host, URL, status, method, size, MIME type   |
+| `fiddler_mcp__session_headers`   | Get request/response headers for a session             |
+| `fiddler_mcp__session_body`      | Get request/response bodies                            |
+| `fiddler_mcp__compare_sessions`  | Fetch several session bodies for side-by-side analysis |
+| `fiddler_mcp__live_stats`        | Buffer depth, capture rate, uptime                     |
+| `fiddler_mcp__sessions_timeline` | Aggregate by time, host, status, or content type       |
+| `fiddler_mcp__sessions_clear`    | Clear buffers after exporting evidence                 |
+| `fiddler_mcp__ekfiddle_sessions` | List sessions already flagged by EKFiddle              |
+| `fiddler_mcp__ekfiddle_threats`  | High-risk EKFiddle hits for triage                     |
 
 Tools return raw data. The LLM reasons over headers, bodies, and EKFiddle comments.
 
@@ -91,12 +91,15 @@ Source for a rebuild lives in `package/`. Maintainer: run `pack-release.bat` fro
 - [TROUBLESHOOTING.txt](docs/TROUBLESHOOTING.txt)
 - [EKFIDDLE_WORKFLOW_GUIDE.md](docs/EKFIDDLE_WORKFLOW_GUIDE.md)
 - [EKFIDDLE_QUICK_REFERENCE.txt](docs/EKFIDDLE_QUICK_REFERENCE.txt)
+- [LOCAL_MODEL.md](docs/LOCAL_MODEL.md)
 
 ## LLM providers
 
 Gemini is the default. DeepSeek and OpenRouter are optional. Switching providers uses `/model` in the client. A missing key is prompted once and saved locally in `gemini-fiddler-config.json`, which is not in this repository.
 
 OpenRouter accepts a freeform `vendor/model` id when an OpenRouter key is present. Curated `/model` numbers for OpenRouter are 14 to 18. Direct DeepSeek API remains `/model 12` and `/model 13`.
+
+A same host OpenAI compatible server can reuse the DeepSeek slot by pointing `deepseek_base_url` at localhost. No extra provider exists in this repo. Steps: [LOCAL_MODEL.md](docs/LOCAL_MODEL.md).
 
 ## Prerequisites
 
